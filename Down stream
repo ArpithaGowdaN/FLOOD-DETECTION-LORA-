@@ -1,0 +1,1584 @@
+/*
+ * ============================================================
+ * OFF-GRID FLASH FLOOD EARLY WARNING SYSTEM
+ *
+ * ESP32 - LoRa RECEIVER + ALERT NODE
+ *
+ * RECEIVES DATA FROM:
+ * STM32F446RE + SX1278 RA-02
+ *
+ * ============================================================
+ *
+ * STM32 PACKET FORMAT:
+ *
+ * ID=UP01,PKT=25,LEVEL=45.20,RATE=3.25,
+ * WT=RAPID RISING,VIB=0.253,VS=HIGH,
+ * WH=OK,VH=OK,FUSION=CRITICAL
+ *
+ * ============================================================
+ *
+ * ESP32 RESPONSIBILITIES:
+ *
+ * 1. Receive LoRa packet
+ * 2. Validate packet
+ * 3. Parse packet
+ * 4. Monitor packet sequence
+ * 5. Detect communication loss
+ * 6. Generate local alert
+ *
+ * ============================================================
+ *
+ * LORA CONFIGURATION:
+ *
+ * Frequency  = 433 MHz
+ * SF         = 7
+ * Bandwidth  = 125 kHz
+ * Coding     = 4/5
+ * CRC        = ON
+ * Preamble   = 8
+ *
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+
+// ============================================================
+// SX1278 RA-02 -> ESP32 CONNECTIONS
+// ============================================================
+
+#define LORA_SCK        18
+#define LORA_MISO       19
+#define LORA_MOSI       23
+#define LORA_SS         5
+#define LORA_RST        14
+#define LORA_DIO0       26
+
+
+// ============================================================
+// ALERT OUTPUT PINS
+// ============================================================
+
+#define GREEN_LED       25
+#define YELLOW_LED      27
+#define RED_LED         32
+#define BUZZER          33
+
+
+// ============================================================
+// LORA CONFIGURATION
+// ============================================================
+
+#define LORA_FREQUENCY      433E6
+#define LORA_BANDWIDTH      125E3
+#define LORA_SPREADING      7
+#define LORA_CODING_RATE    5
+#define LORA_PREAMBLE       8
+
+
+// ============================================================
+// COMMUNICATION TIMEOUT
+// ============================================================
+//
+// STM32 sensor processing takes some time before each
+// transmission, therefore 5 seconds is used.
+//
+
+#define COMMUNICATION_TIMEOUT_MS    5000
+
+
+// ============================================================
+// FLOOD PACKET STRUCTURE
+// ============================================================
+
+struct FloodPacket
+{
+    String nodeID;
+
+    unsigned long packetNumber;
+
+    float waterLevel;
+
+    float waterRate;
+
+    String waterTrend;
+
+    float vibration;
+
+    String vibrationState;
+
+    String waterHealth;
+
+    String vibrationHealth;
+
+    String fusionState;
+
+    int rssi;
+
+    float snr;
+
+    bool valid;
+};
+
+
+// ============================================================
+// GLOBAL VARIABLES
+// ============================================================
+
+FloodPacket currentPacket;
+
+unsigned long lastPacketTime = 0;
+
+unsigned long receivedPackets = 0;
+
+unsigned long missedPackets = 0;
+
+unsigned long duplicatePackets = 0;
+
+unsigned long lastPacketNumber = 0;
+
+bool communicationLost = true;
+
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+bool initializeLoRa();
+
+bool receiveLoRaPacket(String &message);
+
+bool parsePacket(String message, FloodPacket &packet);
+
+String getValue(String data, String key);
+
+bool packetContainsRequiredFields(String message);
+
+void processPacket(FloodPacket &packet);
+
+void updateAlert();
+
+void normalAlert();
+
+void watchAlert();
+
+void warningAlert();
+
+void criticalAlert();
+
+void sensorFaultAlert();
+
+void communicationLostAlert();
+
+void printPacket(FloodPacket &packet);
+
+void checkCommunication();
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("   OFF-GRID FLASH FLOOD ALERT NODE");
+    Serial.println("==========================================");
+    Serial.println("ESP32 + SX1278 RA-02");
+    Serial.println("------------------------------------------");
+
+
+    // --------------------------------------------------------
+    // ALERT PINS
+    // --------------------------------------------------------
+
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(YELLOW_LED, OUTPUT);
+    pinMode(RED_LED, OUTPUT);
+    pinMode(BUZZER, OUTPUT);
+
+
+    // Initially OFF
+
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BUZZER, LOW);
+
+
+    // --------------------------------------------------------
+    // SPI INITIALIZATION
+    // --------------------------------------------------------
+
+    SPI.begin(
+        LORA_SCK,
+        LORA_MISO,
+        LORA_MOSI,
+        LORA_SS
+    );
+
+
+    // --------------------------------------------------------
+    // LORA INITIALIZATION
+    // --------------------------------------------------------
+
+    if (initializeLoRa())
+    {
+        Serial.println();
+        Serial.println("[LORA] Initialization SUCCESS");
+    }
+    else
+    {
+        Serial.println();
+        Serial.println("[LORA] Initialization FAILED");
+
+        /*
+         * Hardware initialization failed.
+         * Blink RED LED continuously.
+         */
+
+        while (true)
+        {
+            digitalWrite(
+                RED_LED,
+                HIGH
+            );
+
+            delay(300);
+
+            digitalWrite(
+                RED_LED,
+                LOW
+            );
+
+            delay(300);
+        }
+    }
+
+
+    Serial.println("------------------------------------------");
+    Serial.println("Waiting for STM32 upstream node...");
+    Serial.println("------------------------------------------");
+
+
+    /*
+     * Initial status.
+     */
+
+    normalAlert();
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop()
+{
+    String message;
+
+
+    // --------------------------------------------------------
+    // CHECK FOR INCOMING LORA PACKET
+    // --------------------------------------------------------
+
+    if (receiveLoRaPacket(message))
+    {
+        Serial.println();
+        Serial.println("==========================================");
+        Serial.println("[LORA] PACKET RECEIVED");
+        Serial.println("==========================================");
+
+        Serial.println(message);
+
+
+        // ----------------------------------------------------
+        // VALIDATE PACKET
+        // ----------------------------------------------------
+
+        if (!packetContainsRequiredFields(message))
+        {
+            Serial.println(
+                "[ERROR] Invalid packet structure"
+            );
+
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // PARSE PACKET
+        // ----------------------------------------------------
+
+        FloodPacket packet;
+
+
+        if (parsePacket(message, packet))
+        {
+            /*
+             * Store received packet.
+             */
+
+            currentPacket = packet;
+
+
+            /*
+             * Communication is alive.
+             */
+
+            lastPacketTime = millis();
+
+            communicationLost = false;
+
+
+            /*
+             * Process packet.
+             */
+
+            processPacket(
+                currentPacket
+            );
+
+
+            /*
+             * Print decoded information.
+             */
+
+            printPacket(
+                currentPacket
+            );
+
+
+            /*
+             * Generate appropriate alert.
+             */
+
+            updateAlert();
+        }
+        else
+        {
+            Serial.println(
+                "[ERROR] Packet parsing FAILED"
+            );
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // CHECK COMMUNICATION TIMEOUT
+    // --------------------------------------------------------
+
+    checkCommunication();
+
+
+    delay(10);
+}
+
+
+// ============================================================
+// INITIALIZE LORA
+// ============================================================
+
+bool initializeLoRa()
+{
+    Serial.println(
+        "[LORA] Starting SX1278..."
+    );
+
+
+    // --------------------------------------------------------
+    // SET LORA PINS
+    // --------------------------------------------------------
+
+    LoRa.setPins(
+        LORA_SS,
+        LORA_RST,
+        LORA_DIO0
+    );
+
+
+    // --------------------------------------------------------
+    // START LORA
+    // --------------------------------------------------------
+
+    if (!LoRa.begin(LORA_FREQUENCY))
+    {
+        return false;
+    }
+
+
+    // --------------------------------------------------------
+    // MATCH STM32 LORA SETTINGS
+    // --------------------------------------------------------
+
+    /*
+     * Bandwidth:
+     * 125 kHz
+     */
+
+    LoRa.setSignalBandwidth(
+        LORA_BANDWIDTH
+    );
+
+
+    /*
+     * Spreading Factor:
+     * SF7
+     */
+
+    LoRa.setSpreadingFactor(
+        LORA_SPREADING
+    );
+
+
+    /*
+     * Coding Rate:
+     * 4/5
+     */
+
+    LoRa.setCodingRate4(
+        LORA_CODING_RATE
+    );
+
+
+    /*
+     * Preamble:
+     * 8 symbols
+     */
+
+    LoRa.setPreambleLength(
+        LORA_PREAMBLE
+    );
+
+
+    /*
+     * Enable CRC.
+     */
+
+    LoRa.enableCrc();
+
+
+    /*
+     * IMPORTANT:
+     *
+     * DO NOT call:
+     *
+     * LoRa.explicitHeader();
+     *
+     * or
+     *
+     * LoRa.explicitHeaderMode();
+     *
+     * because your installed library keeps that function
+     * private.
+     *
+     * The library's default packet mode is compatible with
+     * the STM32 explicit-header configuration.
+     */
+
+
+    /*
+     * Start receiver.
+     */
+
+    LoRa.receive();
+
+
+    // --------------------------------------------------------
+    // PRINT CONFIGURATION
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println(
+        "[LORA] Configuration"
+    );
+
+    Serial.println(
+        "------------------------------------------"
+    );
+
+    Serial.println(
+        "Frequency : 433 MHz"
+    );
+
+    Serial.println(
+        "Bandwidth : 125 kHz"
+    );
+
+    Serial.println(
+        "SF        : 7"
+    );
+
+    Serial.println(
+        "Coding    : 4/5"
+    );
+
+    Serial.println(
+        "Preamble  : 8"
+    );
+
+    Serial.println(
+        "CRC       : ON"
+    );
+
+    Serial.println(
+        "Header    : DEFAULT"
+    );
+
+    Serial.println(
+        "------------------------------------------"
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// RECEIVE LORA PACKET
+// ============================================================
+
+bool receiveLoRaPacket(String &message)
+{
+    int packetSize = LoRa.parsePacket();
+
+
+    /*
+     * No packet available.
+     */
+
+    if (packetSize == 0)
+    {
+        return false;
+    }
+
+
+    /*
+     * Clear previous message.
+     */
+
+    message = "";
+
+
+    /*
+     * Read complete LoRa packet.
+     */
+
+    while (LoRa.available())
+    {
+        message += (char)LoRa.read();
+    }
+
+
+    /*
+     * Display radio information.
+     */
+
+    Serial.print(
+        "[LORA] RSSI : "
+    );
+
+    Serial.print(
+        LoRa.packetRssi()
+    );
+
+    Serial.println(
+        " dBm"
+    );
+
+
+    Serial.print(
+        "[LORA] SNR  : "
+    );
+
+    Serial.print(
+        LoRa.packetSnr()
+    );
+
+    Serial.println(
+        " dB"
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// VALIDATE PACKET STRUCTURE
+// ============================================================
+
+bool packetContainsRequiredFields(
+    String message
+)
+{
+    if (!message.startsWith("ID="))
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("PKT=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("LEVEL=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("RATE=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("WT=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("VIB=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("VS=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("WH=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("VH=") < 0)
+    {
+        return false;
+    }
+
+
+    if (message.indexOf("FUSION=") < 0)
+    {
+        return false;
+    }
+
+
+    return true;
+}
+
+
+// ============================================================
+// EXTRACT VALUE FROM PACKET
+// ============================================================
+//
+// Example:
+//
+// LEVEL=45.20
+//
+// getValue(message, "LEVEL=")
+//
+// returns:
+//
+// 45.20
+//
+
+String getValue(
+    String data,
+    String key
+)
+{
+    int start =
+        data.indexOf(key);
+
+
+    if (start < 0)
+    {
+        return "";
+    }
+
+
+    start += key.length();
+
+
+    int end =
+        data.indexOf(
+            ",",
+            start
+        );
+
+
+    if (end < 0)
+    {
+        end = data.length();
+    }
+
+
+    return data.substring(
+        start,
+        end
+    );
+}
+
+
+// ============================================================
+// PARSE PACKET
+// ============================================================
+
+bool parsePacket(
+    String message,
+    FloodPacket &packet
+)
+{
+    String value;
+
+
+    packet.valid = false;
+
+
+    // --------------------------------------------------------
+    // NODE ID
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "ID="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.nodeID =
+        value;
+
+
+    // --------------------------------------------------------
+    // PACKET NUMBER
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "PKT="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.packetNumber =
+        strtoul(
+            value.c_str(),
+            NULL,
+            10
+        );
+
+
+    // --------------------------------------------------------
+    // WATER LEVEL
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "LEVEL="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.waterLevel =
+        value.toFloat();
+
+
+    // --------------------------------------------------------
+    // WATER RISE RATE
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "RATE="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.waterRate =
+        value.toFloat();
+
+
+    // --------------------------------------------------------
+    // WATER TREND
+    // --------------------------------------------------------
+
+    packet.waterTrend =
+        getValue(
+            message,
+            "WT="
+        );
+
+
+    // --------------------------------------------------------
+    // VIBRATION
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "VIB="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.vibration =
+        value.toFloat();
+
+
+    // --------------------------------------------------------
+    // VIBRATION STATE
+    // --------------------------------------------------------
+
+    packet.vibrationState =
+        getValue(
+            message,
+            "VS="
+        );
+
+
+    // --------------------------------------------------------
+    // WATER HEALTH
+    // --------------------------------------------------------
+
+    packet.waterHealth =
+        getValue(
+            message,
+            "WH="
+        );
+
+
+    // --------------------------------------------------------
+    // VIBRATION HEALTH
+    // --------------------------------------------------------
+
+    packet.vibrationHealth =
+        getValue(
+            message,
+            "VH="
+        );
+
+
+    // --------------------------------------------------------
+    // FUSION STATE
+    // --------------------------------------------------------
+
+    value =
+        getValue(
+            message,
+            "FUSION="
+        );
+
+
+    if (value.length() == 0)
+    {
+        return false;
+    }
+
+
+    packet.fusionState =
+        value;
+
+
+    // --------------------------------------------------------
+    // RADIO INFORMATION
+    // --------------------------------------------------------
+
+    packet.rssi =
+        LoRa.packetRssi();
+
+
+    packet.snr =
+        LoRa.packetSnr();
+
+
+    packet.valid = true;
+
+
+    return true;
+}
+
+
+// ============================================================
+// PROCESS PACKET
+// ============================================================
+
+void processPacket(
+    FloodPacket &packet
+)
+{
+    receivedPackets++;
+
+
+    // --------------------------------------------------------
+    // FIRST PACKET
+    // --------------------------------------------------------
+
+    if (lastPacketNumber == 0)
+    {
+        lastPacketNumber =
+            packet.packetNumber;
+
+
+        Serial.println(
+            "[PACKET] First packet received"
+        );
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // DUPLICATE PACKET
+    // --------------------------------------------------------
+
+    if (packet.packetNumber ==
+        lastPacketNumber)
+    {
+        duplicatePackets++;
+
+
+        Serial.println(
+            "[PACKET] DUPLICATE packet"
+        );
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // NEW PACKET
+    // --------------------------------------------------------
+
+    if (packet.packetNumber >
+        lastPacketNumber)
+    {
+        /*
+         * Check for missed packets.
+         */
+
+        if (packet.packetNumber >
+            lastPacketNumber + 1)
+        {
+            unsigned long missed =
+                packet.packetNumber -
+                lastPacketNumber -
+                1;
+
+
+            missedPackets +=
+                missed;
+
+
+            Serial.print(
+                "[PACKET] Missed packets: "
+            );
+
+            Serial.println(
+                missed
+            );
+        }
+
+
+        lastPacketNumber =
+            packet.packetNumber;
+
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // OLD / OUT OF ORDER PACKET
+    // --------------------------------------------------------
+
+    Serial.println(
+        "[PACKET] OUT-OF-ORDER packet"
+    );
+}
+
+
+// ============================================================
+// PRINT RECEIVED DATA
+// ============================================================
+
+void printPacket(
+    FloodPacket &packet
+)
+{
+    Serial.println();
+
+    Serial.println(
+        "---------- UPSTREAM DATA ----------"
+    );
+
+
+    Serial.print(
+        "Node ID       : "
+    );
+
+    Serial.println(
+        packet.nodeID
+    );
+
+
+    Serial.print(
+        "Packet        : "
+    );
+
+    Serial.println(
+        packet.packetNumber
+    );
+
+
+    Serial.print(
+        "Water Level   : "
+    );
+
+    Serial.print(
+        packet.waterLevel,
+        2
+    );
+
+    Serial.println(
+        " cm"
+    );
+
+
+    Serial.print(
+        "Rise Rate     : "
+    );
+
+    Serial.print(
+        packet.waterRate,
+        2
+    );
+
+    Serial.println(
+        " cm/min"
+    );
+
+
+    Serial.print(
+        "Water Trend   : "
+    );
+
+    Serial.println(
+        packet.waterTrend
+    );
+
+
+    Serial.print(
+        "Vibration     : "
+    );
+
+    Serial.print(
+        packet.vibration,
+        3
+    );
+
+    Serial.println(
+        " g"
+    );
+
+
+    Serial.print(
+        "Vibration     : "
+    );
+
+    Serial.println(
+        packet.vibrationState
+    );
+
+
+    Serial.print(
+        "Water Health  : "
+    );
+
+    Serial.println(
+        packet.waterHealth
+    );
+
+
+    Serial.print(
+        "Vibration Hlth: "
+    );
+
+    Serial.println(
+        packet.vibrationHealth
+    );
+
+
+    Serial.print(
+        "Fusion Status : "
+    );
+
+    Serial.println(
+        packet.fusionState
+    );
+
+
+    Serial.print(
+        "RSSI          : "
+    );
+
+    Serial.print(
+        packet.rssi
+    );
+
+    Serial.println(
+        " dBm"
+    );
+
+
+    Serial.print(
+        "SNR           : "
+    );
+
+    Serial.print(
+        packet.snr,
+        2
+    );
+
+    Serial.println(
+        " dB"
+    );
+
+
+    Serial.println(
+        "-----------------------------------"
+    );
+}
+
+
+// ============================================================
+// SELECT ALERT
+// ============================================================
+
+void updateAlert()
+{
+    // --------------------------------------------------------
+    // SENSOR FAULT
+    // --------------------------------------------------------
+
+    if (currentPacket.fusionState ==
+        "SENSOR FAULT")
+    {
+        sensorFaultAlert();
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // CRITICAL
+    // --------------------------------------------------------
+
+    if (currentPacket.fusionState ==
+        "CRITICAL")
+    {
+        criticalAlert();
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // WARNING
+    // --------------------------------------------------------
+
+    if (currentPacket.fusionState ==
+        "WARNING")
+    {
+        warningAlert();
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // WATCH
+    // --------------------------------------------------------
+
+    if (currentPacket.fusionState ==
+        "WATCH")
+    {
+        watchAlert();
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // NORMAL
+    // --------------------------------------------------------
+
+    normalAlert();
+}
+
+
+// ============================================================
+// NORMAL ALERT
+// ============================================================
+
+void normalAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        LOW
+    );
+
+    digitalWrite(
+        RED_LED,
+        LOW
+    );
+
+    digitalWrite(
+        BUZZER,
+        LOW
+    );
+
+
+    Serial.println(
+        "[ALERT] NORMAL"
+    );
+}
+
+
+// ============================================================
+// WATCH ALERT
+// ============================================================
+
+void watchAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        LOW
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        RED_LED,
+        LOW
+    );
+
+    digitalWrite(
+        BUZZER,
+        LOW
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "[ALERT] WATCH"
+    );
+}
+
+
+// ============================================================
+// WARNING ALERT
+// ============================================================
+
+void warningAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        LOW
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        RED_LED,
+        LOW
+    );
+
+
+    /*
+     * Short warning beep.
+     */
+
+    digitalWrite(
+        BUZZER,
+        HIGH
+    );
+
+    delay(150);
+
+    digitalWrite(
+        BUZZER,
+        LOW
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "[ALERT] WARNING"
+    );
+}
+
+
+// ============================================================
+// CRITICAL ALERT
+// ============================================================
+
+void criticalAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        LOW
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        LOW
+    );
+
+    digitalWrite(
+        RED_LED,
+        HIGH
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    Serial.println(
+        "!!!        CRITICAL ALERT         !!!"
+    );
+
+    Serial.println(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+
+    /*
+     * Three strong buzzer pulses.
+     */
+
+    for (int i = 0; i < 3; i++)
+    {
+        digitalWrite(
+            BUZZER,
+            HIGH
+        );
+
+        delay(200);
+
+
+        digitalWrite(
+            BUZZER,
+            LOW
+        );
+
+        delay(100);
+    }
+}
+
+
+// ============================================================
+// SENSOR FAULT ALERT
+// ============================================================
+
+void sensorFaultAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        LOW
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        RED_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        BUZZER,
+        LOW
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "[ALERT] UPSTREAM SENSOR FAULT"
+    );
+}
+
+
+// ============================================================
+// CHECK COMMUNICATION
+// ============================================================
+
+void checkCommunication()
+{
+    /*
+     * No timeout before first packet.
+     */
+
+    if (lastPacketTime == 0)
+    {
+        return;
+    }
+
+
+    unsigned long elapsed =
+        millis() -
+        lastPacketTime;
+
+
+    /*
+     * Communication lost.
+     */
+
+    if (elapsed >
+        COMMUNICATION_TIMEOUT_MS)
+    {
+        if (!communicationLost)
+        {
+            communicationLost = true;
+
+            communicationLostAlert();
+        }
+    }
+}
+
+
+// ============================================================
+// COMMUNICATION LOST ALERT
+// ============================================================
+
+void communicationLostAlert()
+{
+    digitalWrite(
+        GREEN_LED,
+        LOW
+    );
+
+    digitalWrite(
+        YELLOW_LED,
+        LOW
+    );
+
+    digitalWrite(
+        RED_LED,
+        HIGH
+    );
+
+    digitalWrite(
+        BUZZER,
+        LOW
+    );
+
+
+    Serial.println();
+
+    Serial.println(
+        "=========================================="
+    );
+
+    Serial.println(
+        "       !!! COMMUNICATION LOST !!!"
+    );
+
+    Serial.println(
+        "=========================================="
+    );
+
+    Serial.println(
+        "No STM32 packet received for 5 seconds."
+    );
+
+
+    Serial.print(
+        "Last packet number: "
+    );
+
+    Serial.println(
+        lastPacketNumber
+    );
+
+
+    Serial.print(
+        "Packets received: "
+    );
+
+    Serial.println(
+        receivedPackets
+    );
+
+
+    Serial.print(
+        "Packets missed: "
+    );
+
+    Serial.println(
+        missedPackets
+    );
+}
