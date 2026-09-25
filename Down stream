@@ -43,6 +43,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 
 // ============================================================
@@ -140,6 +142,226 @@ unsigned long duplicatePackets = 0;
 unsigned long lastPacketNumber = 0;
 
 bool communicationLost = true;
+
+
+// ============================================================
+// OFFLINE WIFI DASHBOARD
+// ============================================================
+#define AP_SSID "FloodWarning-ESP32"
+#define AP_PASSWORD "flood1234"
+#define BATTERY_ADC_PIN 34
+#define BATTERY_RTOP_OHM 100000.0f
+#define BATTERY_RBOTTOM_OHM 100000.0f
+#define HISTORY_SIZE 60
+
+WebServer dashboardServer(80);
+
+struct HistoryPoint {
+    unsigned long t;
+    float level;
+    float rate;
+    float vibration;
+    int rssi;
+    float snr;
+    float battery;
+};
+
+HistoryPoint historyData[HISTORY_SIZE];
+int historyCount = 0;
+int historyWrite = 0;
+unsigned long lastHistorySample = 0;
+const unsigned long HISTORY_INTERVAL_MS = 1000;
+
+float readBatteryVoltage()
+{
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+    int raw = analogRead(BATTERY_ADC_PIN);
+    float adcVoltage = (raw / 4095.0f) * 3.3f;
+    return adcVoltage * ((BATTERY_RTOP_OHM + BATTERY_RBOTTOM_OHM) / BATTERY_RBOTTOM_OHM);
+}
+
+float batteryPercent(float v)
+{
+    // Approximate 1S Li-ion voltage estimate only.
+    if (v <= 3.20f) return 0.0f;
+    if (v >= 4.20f) return 100.0f;
+    return ((v - 3.20f) / 1.00f) * 100.0f;
+}
+
+String jsonEscape(String s)
+{
+    s.replace("\\", "\\\\");
+    s.replace("\"", "\\\"");
+    s.replace("\n", "\\n");
+    s.replace("\r", "\\r");
+    return s;
+}
+
+void addDashboardHistory()
+{
+    HistoryPoint &p = historyData[historyWrite];
+    p.t = millis();
+    p.level = currentPacket.waterLevel;
+    p.rate = currentPacket.waterRate;
+    p.vibration = currentPacket.vibration;
+    p.rssi = currentPacket.rssi;
+    p.snr = currentPacket.snr;
+    p.battery = readBatteryVoltage();
+
+    historyWrite = (historyWrite + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) historyCount++;
+}
+
+void handleDashboardStatus()
+{
+    unsigned long now = millis();
+    float age = (lastPacketTime == 0 || communicationLost) ? 9999.0f : (now - lastPacketTime) / 1000.0f;
+    float bv = readBatteryVoltage();
+
+    String json = "{";
+    json += "\"nodeID\":\"" + jsonEscape(currentPacket.nodeID) + "\",";
+    json += "\"packetNumber\":" + String(currentPacket.packetNumber) + ",";
+    json += "\"waterLevel\":" + String(currentPacket.waterLevel,2) + ",";
+    json += "\"waterRate\":" + String(currentPacket.waterRate,2) + ",";
+    json += "\"waterTrend\":\"" + jsonEscape(currentPacket.waterTrend) + "\",";
+    json += "\"vibration\":" + String(currentPacket.vibration,3) + ",";
+    json += "\"vibrationState\":\"" + jsonEscape(currentPacket.vibrationState) + "\",";
+    json += "\"waterHealth\":\"" + jsonEscape(currentPacket.waterHealth) + "\",";
+    json += "\"vibrationHealth\":\"" + jsonEscape(currentPacket.vibrationHealth) + "\",";
+    json += "\"fusionState\":\"" + jsonEscape(currentPacket.fusionState) + "\",";
+    json += "\"rssi\":" + String(currentPacket.rssi) + ",";
+    json += "\"snr\":" + String(currentPacket.snr,2) + ",";
+    json += "\"receivedPackets\":" + String(receivedPackets) + ",";
+    json += "\"missedPackets\":" + String(missedPackets) + ",";
+    json += "\"duplicatePackets\":" + String(duplicatePackets) + ",";
+    json += "\"packetAge\":" + String(age,1) + ",";
+    json += "\"communicationLost\":" + String(communicationLost ? "true" : "false") + ",";
+    json += "\"batteryVoltage\":" + String(bv,2) + ",";
+    json += "\"batteryPercent\":" + String(batteryPercent(bv),0) + ",";
+    json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"cpuMHz\":" + String(getCpuFrequencyMhz()) + ",";
+    json += "\"uptime\":" + String(millis()/1000) + ",";
+    json += "\"clients\":" + String(WiFi.softAPgetStationNum());
+    json += "}";
+    dashboardServer.send(200, "application/json", json);
+}
+
+void handleDashboardHistory()
+{
+    String json = "[";
+    int start = (historyCount < HISTORY_SIZE) ? 0 : historyWrite;
+    for (int i=0; i<historyCount; i++) {
+        int idx = (start + i) % HISTORY_SIZE;
+        if (i) json += ",";
+        json += "{";
+        json += "\"t\":" + String(historyData[idx].t) + ",";
+        json += "\"level\":" + String(historyData[idx].level,2) + ",";
+        json += "\"rate\":" + String(historyData[idx].rate,2) + ",";
+        json += "\"vibration\":" + String(historyData[idx].vibration,3) + ",";
+        json += "\"rssi\":" + String(historyData[idx].rssi) + ",";
+        json += "\"snr\":" + String(historyData[idx].snr,2) + ",";
+        json += "\"battery\":" + String(historyData[idx].battery,2);
+        json += "}";
+    }
+    json += "]";
+    dashboardServer.send(200, "application/json", json);
+}
+
+void handleDashboardHealth()
+{
+    String json = "{";
+    json += "\"communicationLost\":" + String(communicationLost ? "true" : "false") + ",";
+    json += "\"waterHealth\":\"" + jsonEscape(currentPacket.waterHealth) + "\",";
+    json += "\"vibrationHealth\":\"" + jsonEscape(currentPacket.vibrationHealth) + "\",";
+    json += "\"fusionState\":\"" + jsonEscape(currentPacket.fusionState) + "\"";
+    json += "}";
+    dashboardServer.send(200, "application/json", json);
+}
+
+void handleDashboardMetrics()
+{
+    String json = "{";
+    json += "\"rssi\":" + String(currentPacket.rssi) + ",";
+    json += "\"snr\":" + String(currentPacket.snr,2) + ",";
+    json += "\"receivedPackets\":" + String(receivedPackets) + ",";
+    json += "\"missedPackets\":" + String(missedPackets) + ",";
+    json += "\"duplicatePackets\":" + String(duplicatePackets) + ",";
+    json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"cpuMHz\":" + String(getCpuFrequencyMhz());
+    json += "}";
+    dashboardServer.send(200, "application/json", json);
+}
+
+const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flood Warning Dashboard</title>
+<style>
+body{font-family:Arial,sans-serif;background:#10151c;color:#eee;margin:0;padding:18px}h1{margin:0 0 6px}.sub{color:#9aa7b5;margin-bottom:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.card{background:#1b222c;border:1px solid #303b48;border-radius:12px;padding:14px}.label{color:#9aa7b5;font-size:12px}.value{font-size:25px;font-weight:bold;margin-top:6px}.status{font-weight:bold}.ok{color:#5ee58a}.warn{color:#ffd166}.bad{color:#ff6b6b}.canvasbox{background:#1b222c;border:1px solid #303b48;border-radius:12px;padding:10px;margin-top:12px}canvas{width:100%;height:190px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:800px){.row{grid-template-columns:1fr}}small{color:#9aa7b5}
+</style></head><body>
+<h1>OFF-GRID FLOOD WARNING</h1><div class="sub">ESP32 local dashboard • No Internet required</div>
+<div class="grid">
+<div class="card"><div class="label">Water Level</div><div class="value" id="level">--</div></div>
+<div class="card"><div class="label">Rise Rate</div><div class="value" id="rate">--</div></div>
+<div class="card"><div class="label">Water Trend</div><div class="value status" id="trend">--</div></div>
+<div class="card"><div class="label">Vibration RMS</div><div class="value" id="vib">--</div></div>
+<div class="card"><div class="label">Vibration State</div><div class="value status" id="vstate">--</div></div>
+<div class="card"><div class="label">Fusion</div><div class="value status" id="fusion">--</div></div>
+<div class="card"><div class="label">Water Health</div><div class="value status" id="whealth">--</div></div>
+<div class="card"><div class="label">Vibration Health</div><div class="value status" id="vhealth">--</div></div>
+<div class="card"><div class="label">RSSI</div><div class="value" id="rssi">--</div></div>
+<div class="card"><div class="label">SNR</div><div class="value" id="snr">--</div></div>
+<div class="card"><div class="label">Battery</div><div class="value" id="battery">--</div></div>
+<div class="card"><div class="label">Communication</div><div class="value status" id="comm">--</div></div>
+<div class="card"><div class="label">Packets</div><div class="value" id="packets">--</div></div>
+<div class="card"><div class="label">Packet Age</div><div class="value" id="age">--</div></div>
+</div>
+<div class="row">
+<div class="canvasbox"><b>Water Level</b><canvas id="c1"></canvas></div>
+<div class="canvasbox"><b>Rise Rate</b><canvas id="c2"></canvas></div>
+</div><div class="row">
+<div class="canvasbox"><b>Vibration</b><canvas id="c3"></canvas></div>
+<div class="canvasbox"><b>RSSI / SNR</b><canvas id="c4"></canvas></div>
+</div><div class="canvasbox"><b>Battery Voltage</b><canvas id="c5"></canvas></div>
+<div class="card" style="margin-top:12px"><small id="system">System: --</small></div>
+<script>
+let H=[];
+function $(id){return document.getElementById(id)}
+function cls(el,v){el.className='value status '+((/CRITICAL|FAULT|LOST/.test(v))?'bad':(/WARNING|WATCH|MEDIUM|HIGH/.test(v))?'warn':'ok')}
+function draw(id,key){let c=$(id),x=c.getContext('2d'),w=c.width=c.clientWidth*devicePixelRatio,h=c.height=c.clientHeight*devicePixelRatio;x.clearRect(0,0,w,h);if(H.length<2)return;let a=H.map(o=>Number(o[key])),mn=Math.min(...a),mx=Math.max(...a);if(mn===mx){mn-=1;mx+=1}x.beginPath();a.forEach((v,i)=>{let px=i*(w-10)/(a.length-1)+5,py=h-5-(v-mn)/(mx-mn)*(h-10);i?x.lineTo(px,py):x.moveTo(px,py)});x.strokeStyle='#67d5ff';x.lineWidth=2*devicePixelRatio;x.stroke()}
+async function update(){try{let s=await fetch('/api/status').then(r=>r.json());$('level').textContent=s.waterLevel.toFixed(2)+' cm';$('rate').textContent=s.waterRate.toFixed(2)+' cm/min';$('trend').textContent=s.waterTrend;cls($('trend'),s.waterTrend);$('vib').textContent=s.vibration.toFixed(3)+' g';$('vstate').textContent=s.vibrationState;cls($('vstate'),s.vibrationState);$('fusion').textContent=s.fusionState;cls($('fusion'),s.fusionState);$('whealth').textContent=s.waterHealth;cls($('whealth'),s.waterHealth);$('vhealth').textContent=s.vibrationHealth;cls($('vhealth'),s.vibrationHealth);$('rssi').textContent=s.rssi+' dBm';$('snr').textContent=s.snr.toFixed(2)+' dB';$('battery').textContent=s.batteryVoltage.toFixed(2)+' V ('+s.batteryPercent+'%)';$('comm').textContent=s.communicationLost?'LOST':'CONNECTED';cls($('comm'),s.communicationLost?'LOST':'CONNECTED');$('packets').textContent=s.receivedPackets+' / '+s.missedPackets+' / '+s.duplicatePackets;$('age').textContent=s.packetAge>100?'--':s.packetAge.toFixed(1)+' s';$('system').textContent='Node '+s.nodeID+' • Packet '+s.packetNumber+' • Water '+s.waterHealth+' • Vibration '+s.vibrationHealth+' • Heap '+s.freeHeap+' B • CPU '+s.cpuMHz+' MHz • Uptime '+s.uptime+' s • Clients '+s.clients;let h=await fetch('/api/history').then(r=>r.json());H=h;draw('c1','level');draw('c2','rate');draw('c3','vibration');draw('c4','rssi');draw('c5','battery')}catch(e){$('comm').textContent='DASHBOARD ERROR';cls($('comm'),'LOST')}}
+setInterval(update,1000);update();window.addEventListener('resize',update);
+</script></body></html>
+)rawliteral";
+
+void handleDashboardRoot()
+{
+    dashboardServer.send(200, "text/html", DASHBOARD_HTML);
+}
+
+void startOfflineDashboard()
+{
+    WiFi.mode(WIFI_AP);
+    if (WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+        Serial.println();
+        Serial.println("==========================================");
+        Serial.println("OFFLINE WIFI DASHBOARD STARTED");
+        Serial.println("SSID: " + String(AP_SSID));
+        Serial.println("Password: " + String(AP_PASSWORD));
+        Serial.print("IP address: ");
+        Serial.println(WiFi.softAPIP());
+        Serial.println("Open http://192.168.4.1");
+        Serial.println("==========================================");
+    } else {
+        Serial.println("[WIFI] AP START FAILED");
+    }
+
+    dashboardServer.on("/", handleDashboardRoot);
+    dashboardServer.on("/api/status", handleDashboardStatus);
+    dashboardServer.on("/api/history", handleDashboardHistory);
+    dashboardServer.on("/api/health", handleDashboardHealth);
+    dashboardServer.on("/api/metrics", handleDashboardMetrics);
+    dashboardServer.begin();
+}
 
 
 // ============================================================
@@ -274,6 +496,9 @@ void setup()
      */
 
     normalAlert();
+
+    // Start the local offline Wi-Fi dashboard.
+    startOfflineDashboard();
 }
 
 
@@ -283,6 +508,14 @@ void setup()
 
 void loop()
 {
+    dashboardServer.handleClient();
+
+    if (millis() - lastHistorySample >= HISTORY_INTERVAL_MS)
+    {
+        lastHistorySample = millis();
+        if (currentPacket.valid) addDashboardHistory();
+    }
+
     String message;
 
 
@@ -307,21 +540,18 @@ void loop()
         if (!packetContainsRequiredFields(message))
         {
             Serial.println(
-                "[ERROR] Invalid packet structure"
+                "[LORA] Ignored non-UP01/invalid packet"
             );
-
-            return;
         }
+        else
+        {
+            // ----------------------------------------------------
+            // PARSE PACKET
+            // ----------------------------------------------------
 
+            FloodPacket packet;
 
-        // ----------------------------------------------------
-        // PARSE PACKET
-        // ----------------------------------------------------
-
-        FloodPacket packet;
-
-
-        if (parsePacket(message, packet))
+            if (parsePacket(message, packet))
         {
             /*
              * Store received packet.
@@ -363,11 +593,12 @@ void loop()
 
             updateAlert();
         }
-        else
-        {
-            Serial.println(
-                "[ERROR] Packet parsing FAILED"
-            );
+            else
+            {
+                Serial.println(
+                    "[ERROR] Packet parsing FAILED"
+                );
+            }
         }
     }
 
@@ -620,7 +851,7 @@ bool packetContainsRequiredFields(
     String message
 )
 {
-    if (!message.startsWith("ID="))
+    if (!message.startsWith("ID=UP01,"))
     {
         return false;
     }
@@ -1384,56 +1615,22 @@ void warningAlert()
 
 void criticalAlert()
 {
-    digitalWrite(
-        GREEN_LED,
-        LOW
-    );
-
-    digitalWrite(
-        YELLOW_LED,
-        LOW
-    );
-
-    digitalWrite(
-        RED_LED,
-        HIGH
-    );
-
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
 
     Serial.println();
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println("!!!        CRITICAL ALERT         !!!");
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 
-    Serial.println(
-        "!!!        CRITICAL ALERT         !!!"
-    );
-
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-
-    /*
-     * Three strong buzzer pulses.
-     */
-
-    for (int i = 0; i < 3; i++)
+    // Five strong buzzer pulses.
+    for (int i = 0; i < 5; i++)
     {
-        digitalWrite(
-            BUZZER,
-            HIGH
-        );
-
-        delay(200);
-
-
-        digitalWrite(
-            BUZZER,
-            LOW
-        );
-
-        delay(100);
+        digitalWrite(BUZZER, HIGH);
+        delay(300);
+        digitalWrite(BUZZER, LOW);
+        delay(150);
     }
 }
 
@@ -1444,31 +1641,24 @@ void criticalAlert()
 
 void sensorFaultAlert()
 {
-    digitalWrite(
-        GREEN_LED,
-        LOW
-    );
-
-    digitalWrite(
-        YELLOW_LED,
-        HIGH
-    );
-
-    digitalWrite(
-        RED_LED,
-        HIGH
-    );
-
-    digitalWrite(
-        BUZZER,
-        LOW
-    );
-
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, HIGH);
+    digitalWrite(RED_LED, HIGH);
 
     Serial.println();
-    Serial.println(
-        "[ALERT] UPSTREAM SENSOR FAULT"
-    );
+    Serial.println("==========================================");
+    Serial.println("       !!! SENSOR FAULT !!!");
+    Serial.println("==========================================");
+    Serial.println("Upstream sensor fault reported by STM32.");
+
+    // Three short fault beeps.
+    for (int i = 0; i < 3; i++)
+    {
+        digitalWrite(BUZZER, HIGH);
+        delay(200);
+        digitalWrite(BUZZER, LOW);
+        delay(200);
+    }
 }
 
 
@@ -1516,69 +1706,31 @@ void checkCommunication()
 
 void communicationLostAlert()
 {
-    digitalWrite(
-        GREEN_LED,
-        LOW
-    );
-
-    digitalWrite(
-        YELLOW_LED,
-        LOW
-    );
-
-    digitalWrite(
-        RED_LED,
-        HIGH
-    );
-
-    digitalWrite(
-        BUZZER,
-        LOW
-    );
-
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, LOW);
+    digitalWrite(RED_LED, HIGH);
 
     Serial.println();
+    Serial.println("==========================================");
+    Serial.println("       !!! COMMUNICATION LOST !!!");
+    Serial.println("==========================================");
+    Serial.println("No STM32 packet received for 5 seconds.");
 
-    Serial.println(
-        "=========================================="
-    );
+    Serial.print("Last packet number: ");
+    Serial.println(lastPacketNumber);
 
-    Serial.println(
-        "       !!! COMMUNICATION LOST !!!"
-    );
+    Serial.print("Packets received: ");
+    Serial.println(receivedPackets);
 
-    Serial.println(
-        "=========================================="
-    );
+    Serial.print("Packets missed: ");
+    Serial.println(missedPackets);
 
-    Serial.println(
-        "No STM32 packet received for 5 seconds."
-    );
-
-
-    Serial.print(
-        "Last packet number: "
-    );
-
-    Serial.println(
-        lastPacketNumber
-    );
-
-
-    Serial.print(
-        "Packets received: "
-    );
-
-    Serial.println(
-        receivedPackets
-    );
-
-
-    Serial.print(
-        "Packets missed: "
-    );
-
-    Serial.println(
-        missedPackets
-    );
+    // Five communication-loss beeps.
+    for (int i = 0; i < 5; i++)
+    {
+        digitalWrite(BUZZER, HIGH);
+        delay(200);
+        digitalWrite(BUZZER, LOW);
+        delay(200);
+    }
 }
