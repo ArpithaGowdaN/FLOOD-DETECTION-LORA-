@@ -1,0 +1,2563 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Flood Warning Sensor Fusion Node
+  *                   STM32F446RE
+  *                   JSN-SR04T + MPU6050 + SX1278 RA-02
+  *
+  *                   LoRa:
+  *                   433 MHz
+  *                   SF7
+  *                   BW 125 kHz
+  *                   CR 4/5
+  *                   TX Power 17 dBm
+  *                   CRC ON
+  ******************************************************************************
+  */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+/* ============================================================
+   PIN DEFINITIONS
+   ============================================================ */
+
+/* ---------- JSN-SR04T ---------- */
+
+#define JSN_TRIG_PORT       GPIOB
+#define JSN_TRIG_PIN        GPIO_PIN_0
+
+#define JSN_ECHO_PORT       GPIOB
+#define JSN_ECHO_PIN        GPIO_PIN_1
+
+
+/* ---------- SX1278 RA-02 ---------- */
+
+#define LORA_NSS_PORT       GPIOB
+#define LORA_NSS_PIN        GPIO_PIN_6
+
+#define LORA_RESET_PORT     GPIOB
+#define LORA_RESET_PIN      GPIO_PIN_7
+
+#define LORA_DIO0_PORT      GPIOC
+#define LORA_DIO0_PIN       GPIO_PIN_7
+
+
+/* ============================================================
+   MPU6050
+   ============================================================ */
+
+#define MPU6050_ADDR          (0x68 << 1)
+
+#define MPU6050_WHO_AM_I     0x75
+#define MPU6050_PWR_MGMT_1   0x6B
+#define MPU6050_SMPLRT_DIV   0x19
+#define MPU6050_CONFIG       0x1A
+#define MPU6050_ACCEL_CONFIG 0x1C
+#define MPU6050_ACCEL_XOUT_H 0x3B
+
+
+/* ============================================================
+   SX1278 REGISTERS
+   ============================================================ */
+
+#define REG_FIFO                    0x00
+#define REG_OP_MODE                 0x01
+#define REG_FRF_MSB                 0x06
+#define REG_FRF_MID                 0x07
+#define REG_FRF_LSB                 0x08
+#define REG_PA_CONFIG               0x09
+#define REG_PA_RAMP                 0x0A
+#define REG_OCP                     0x0B
+#define REG_LNA                     0x0C
+#define REG_FIFO_ADDR_PTR           0x0D
+#define REG_FIFO_TX_BASE_ADDR       0x0E
+#define REG_FIFO_RX_BASE_ADDR       0x0F
+#define REG_FIFO_RX_CURRENT_ADDR    0x10
+#define REG_IRQ_FLAGS               0x12
+#define REG_RX_NB_BYTES             0x13
+#define REG_MODEM_CONFIG1           0x1D
+#define REG_MODEM_CONFIG2           0x1E
+#define REG_PREAMBLE_MSB            0x20
+#define REG_PREAMBLE_LSB            0x21
+#define REG_PAYLOAD_LENGTH          0x22
+#define REG_MODEM_CONFIG3           0x26
+#define REG_DIO_MAPPING1            0x40
+#define REG_VERSION                 0x42
+
+/* ============================================================
+   SX1278 MODES
+   ============================================================ */
+
+#define MODE_LONG_RANGE_MODE        0x80
+
+#define MODE_SLEEP                  0x00
+#define MODE_STDBY                  0x01
+#define MODE_TX                     0x03
+
+/* ============================================================
+   SX1278 IRQ
+   ============================================================ */
+
+#define IRQ_TX_DONE_MASK            0x08
+
+/* ============================================================
+   WATER SENSOR
+   ============================================================ */
+
+#define WATER_REFERENCE_CM          58.5f
+
+#define JSN_MIN_DISTANCE_CM         2.0f
+#define JSN_MAX_DISTANCE_CM         450.0f
+
+#define JSN_SAMPLES                 5
+#define JSN_VALID_REQUIRED          3
+
+#define WATER_RISING_THRESHOLD      0.5f
+#define WATER_RAPID_THRESHOLD       3.0f
+
+
+/* ============================================================
+   VIBRATION
+   ============================================================ */
+
+#define VIBRATION_SAMPLES           20
+
+#define VIB_LOW_THRESHOLD           0.020f
+#define VIB_HIGH_THRESHOLD          0.200f
+
+
+/* ============================================================
+   FAULT / FUSION
+   ============================================================ */
+
+#define SENSOR_FAULT_CYCLES        3
+#define SENSOR_RECOVERY_CYCLES     3
+
+#define HAZARD_PERSISTENCE         2
+#define NORMAL_PERSISTENCE         3
+
+
+/* ============================================================
+   LORA
+   ============================================================ */
+
+#define LORA_FREQUENCY_HZ          433000000UL
+
+#define LORA_TX_POWER              17
+
+#define LORA_SPREADING_FACTOR     7
+
+#define LORA_BANDWIDTH_125KHZ     0x70
+
+#define LORA_CODING_RATE_4_5      0x02
+
+#define LORA_PREAMBLE_LENGTH      8
+
+#define LORA_PACKET_MAX_LENGTH    255
+
+#define NODE_ID                    "UP01"
+
+
+/* ============================================================
+   HAL HANDLES
+   ============================================================ */
+
+I2C_HandleTypeDef hi2c1;
+SPI_HandleTypeDef hspi1;
+UART_HandleTypeDef huart2;
+
+
+/* ============================================================
+   ENUMS
+   ============================================================ */
+
+typedef enum
+{
+    WATER_STABLE = 0,
+    WATER_RISING,
+    WATER_RAPID_RISING,
+    WATER_FALLING,
+    WATER_SENSOR_FAULT
+} WaterTrend_t;
+
+
+typedef enum
+{
+    VIB_LOW = 0,
+    VIB_MEDIUM,
+    VIB_HIGH,
+    VIB_SENSOR_FAULT
+} VibrationState_t;
+
+
+typedef enum
+{
+    FUSION_NORMAL = 0,
+    FUSION_WATCH,
+    FUSION_WARNING,
+    FUSION_CRITICAL,
+    FUSION_SENSOR_FAULT
+} FusionState_t;
+
+
+/* ============================================================
+   GLOBAL VARIABLES
+   ============================================================ */
+
+float current_water_level = 0.0f;
+float previous_water_level = 0.0f;
+
+float water_rate = 0.0f;
+float current_distance = 0.0f;
+
+float vibration_rms = 0.0f;
+
+WaterTrend_t water_trend = WATER_STABLE;
+VibrationState_t vibration_state = VIB_LOW;
+FusionState_t fusion_state = FUSION_NORMAL;
+
+uint8_t water_health = 0;
+uint8_t vibration_health = 0;
+
+uint8_t water_bad_cycles = 0;
+uint8_t water_good_cycles = 0;
+
+uint8_t vibration_bad_cycles = 0;
+uint8_t vibration_good_cycles = 0;
+
+uint8_t hazard_count = 0;
+uint8_t normal_count = 0;
+
+uint32_t packet_number = 0;
+
+
+/* ============================================================
+   FUNCTION PROTOTYPES
+   ============================================================ */
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+
+void Error_Handler(void);
+
+void DWT_Init(void);
+uint32_t DWT_GetMicros(void);
+
+void PrintFloat2(float value);
+void PrintFloat3(float value);
+
+
+/* ---------- MPU6050 ---------- */
+
+uint8_t MPU6050_Init(void);
+
+uint8_t MPU6050_Read(uint8_t reg,
+                     uint8_t *data,
+                     uint16_t len);
+
+
+/* ---------- JSN ---------- */
+
+uint8_t JSN_ReadDistance(float *distance);
+
+float JSN_ReadFilteredDistance(uint8_t *valid_count);
+
+void UpdateWaterSensor(void);
+
+
+/* ---------- Vibration ---------- */
+
+void UpdateVibrationSensor(void);
+
+
+/* ---------- Fusion ---------- */
+
+void UpdateFusion(void);
+
+
+/* ---------- LoRa ---------- */
+
+void LoRa_Select(void);
+void LoRa_Unselect(void);
+
+uint8_t LoRa_ReadRegister(uint8_t address);
+
+void LoRa_WriteRegister(uint8_t address,
+                        uint8_t value);
+
+void LoRa_SetFrequency(uint32_t frequency);
+
+uint8_t LoRa_Init(void);
+
+void LoRa_SetTxPower(uint8_t power);
+
+uint8_t LoRa_SendPacket(uint8_t *data,
+                        uint8_t length);
+
+void LoRa_Reset(void);
+
+
+/* ---------- Strings ---------- */
+
+const char *WaterTrendString(WaterTrend_t state);
+
+const char *VibrationString(VibrationState_t state);
+
+const char *FusionString(FusionState_t state);
+
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+int main(void)
+{
+    HAL_Init();
+
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_SPI1_Init();
+    MX_USART2_UART_Init();
+
+    DWT_Init();
+
+    printf("\r\n");
+    printf("========================================\r\n");
+    printf("   FLOOD WARNING SENSOR FUSION NODE\r\n");
+    printf("========================================\r\n");
+    printf("STM32F446RE\r\n");
+    printf("JSN-SR04T + MPU6050 + SX1278\r\n");
+    printf("----------------------------------------\r\n");
+
+
+    /* ========================================================
+       MPU6050
+       ======================================================== */
+
+    printf("Initializing MPU6050...\r\n");
+
+    if (MPU6050_Init())
+    {
+        printf("MPU6050 initialization SUCCESS.\r\n");
+
+        vibration_health = 1;
+    }
+    else
+    {
+        printf("MPU6050 initialization FAILED.\r\n");
+
+        vibration_health = 0;
+    }
+
+
+    printf("----------------------------------------\r\n");
+
+
+    /* ========================================================
+       LORA
+       ======================================================== */
+
+    printf("Initializing SX1278 LoRa...\r\n");
+
+    if (LoRa_Init())
+    {
+        printf("SX1278 LoRa initialization SUCCESS.\r\n");
+        printf("Frequency : 433 MHz\r\n");
+        printf("Power     : 17 dBm\r\n");
+        printf("SF        : 7\r\n");
+        printf("BW        : 125 kHz\r\n");
+        printf("CR        : 4/5\r\n");
+        printf("CRC       : ENABLED\r\n");
+    }
+    else
+    {
+        printf("SX1278 LoRa initialization FAILED.\r\n");
+    }
+
+
+    printf("----------------------------------------\r\n");
+
+    printf("Water reference: ");
+    PrintFloat2(WATER_REFERENCE_CM);
+    printf(" cm\r\n");
+
+    printf("Water trend logic enabled.\r\n");
+
+    printf("Fault requires 3 consecutive bad cycles.\r\n");
+
+    printf("----------------------------------------\r\n");
+
+    HAL_Delay(1000);
+
+
+    /* ========================================================
+       MAIN LOOP
+       ======================================================== */
+
+    while (1)
+    {
+        printf("\r\n");
+        printf("========================================\r\n");
+        printf("[LOOP] Reading sensors...\r\n");
+        printf("========================================\r\n");
+
+
+        /* ====================================================
+           WATER
+           ==================================================== */
+
+        UpdateWaterSensor();
+
+
+        /* ====================================================
+           VIBRATION
+           ==================================================== */
+
+        UpdateVibrationSensor();
+
+
+        /* ====================================================
+           FUSION
+           ==================================================== */
+
+        UpdateFusion();
+
+
+        /* ====================================================
+           SERIAL STATUS
+           ==================================================== */
+
+        printf("\r\n");
+
+        printf("WATER LEVEL : ");
+        PrintFloat2(current_water_level);
+        printf(" cm\r\n");
+
+        printf("RATE        : ");
+        PrintFloat2(water_rate);
+        printf(" cm/min\r\n");
+
+        printf("WATER TREND : %s\r\n",
+               WaterTrendString(water_trend));
+
+        printf("VIBRATION   : ");
+        PrintFloat3(vibration_rms);
+        printf(" g\r\n");
+
+        printf("VIB STATE   : %s\r\n",
+               VibrationString(vibration_state));
+
+        printf("WATER HEALTH: %s\r\n",
+               water_health ? "OK" : "FAULT");
+
+        printf("VIB HEALTH  : %s\r\n",
+               vibration_health ? "OK" : "FAULT");
+
+        printf("FUSION      : %s\r\n",
+               FusionString(fusion_state));
+
+
+        /* ====================================================
+           BUILD LORA PACKET
+           ==================================================== */
+
+        char packet[250];
+
+        packet_number++;
+
+        int packet_length = snprintf(
+            packet,
+            sizeof(packet),
+
+            "ID=%s,"
+            "PKT=%lu,"
+            "LEVEL=",
+            NODE_ID,
+            (unsigned long)packet_number
+        );
+
+        /*
+         * Append floating-point values manually so we don't
+         * depend on printf floating-point support.
+         */
+
+        char temp[50];
+
+        int temp_len;
+
+        temp_len = snprintf(temp,
+                            sizeof(temp),
+                            "%ld.%02ld,"
+                            "RATE=",
+                            (long)((int32_t)(current_water_level * 100.0f) / 100),
+                            (long)abs((int32_t)(current_water_level * 100.0f) % 100));
+
+        if (packet_length + temp_len < sizeof(packet))
+        {
+            strcat(packet, temp);
+            packet_length += temp_len;
+        }
+
+
+        /*
+         * Replace the temporary LEVEL construction with a
+         * reliable integer-scaled formatting approach.
+         */
+
+        packet[0] = '\0';
+
+        strcat(packet, "ID=");
+        strcat(packet, NODE_ID);
+
+        strcat(packet, ",PKT=");
+
+        char num[20];
+
+        snprintf(num,
+                 sizeof(num),
+                 "%lu",
+                 (unsigned long)packet_number);
+
+        strcat(packet, num);
+
+
+        /* LEVEL */
+
+        strcat(packet, ",LEVEL=");
+
+        int32_t level_scaled =
+            (int32_t)(current_water_level * 100.0f + 0.5f);
+
+        snprintf(num,
+                 sizeof(num),
+                 "%ld.%02ld",
+                 (long)(level_scaled / 100),
+                 (long)(level_scaled % 100));
+
+        strcat(packet, num);
+
+
+        /* RATE */
+
+        strcat(packet, ",RATE=");
+
+        int32_t rate_scaled =
+            (int32_t)(water_rate * 100.0f);
+
+        if (rate_scaled < 0)
+        {
+            strcat(packet, "-");
+
+            rate_scaled = -rate_scaled;
+        }
+
+        snprintf(num,
+                 sizeof(num),
+                 "%ld.%02ld",
+                 (long)(rate_scaled / 100),
+                 (long)(rate_scaled % 100));
+
+        strcat(packet, num);
+
+
+        /* WATER TREND */
+
+        strcat(packet, ",WT=");
+        strcat(packet,
+               WaterTrendString(water_trend));
+
+
+        /* VIBRATION */
+
+        strcat(packet, ",VIB=");
+
+        int32_t vib_scaled =
+            (int32_t)(vibration_rms * 1000.0f + 0.5f);
+
+        snprintf(num,
+                 sizeof(num),
+                 "%ld.%03ld",
+                 (long)(vib_scaled / 1000),
+                 (long)(vib_scaled % 1000));
+
+        strcat(packet, num);
+
+
+        /* VIBRATION STATE */
+
+        strcat(packet, ",VS=");
+        strcat(packet,
+               VibrationString(vibration_state));
+
+
+        /* WATER HEALTH */
+
+        strcat(packet, ",WH=");
+
+        strcat(packet,
+               water_health ? "OK" : "FAULT");
+
+
+        /* VIBRATION HEALTH */
+
+        strcat(packet, ",VH=");
+
+        strcat(packet,
+               vibration_health ? "OK" : "FAULT");
+
+
+        /* FUSION */
+
+        strcat(packet, ",FUSION=");
+
+        strcat(packet,
+               FusionString(fusion_state));
+
+
+        /* ====================================================
+           TRANSMIT
+           ==================================================== */
+
+        printf("\r\n[LORA] TX PACKET:\r\n");
+        printf("%s\r\n", packet);
+
+        uint8_t packet_len =
+            (uint8_t)strlen(packet);
+
+        if (packet_len > 0 &&
+            packet_len < LORA_PACKET_MAX_LENGTH)
+        {
+            if (LoRa_SendPacket(
+                    (uint8_t *)packet,
+                    packet_len))
+            {
+                printf("[LORA] TX DONE\r\n");
+            }
+            else
+            {
+                printf("[LORA] TX FAILED / TIMEOUT\r\n");
+            }
+        }
+        else
+        {
+            printf("[LORA] PACKET TOO LONG\r\n");
+        }
+
+
+        printf("========================================\r\n");
+
+
+        /*
+         * Wait before next decision/transmission.
+         */
+        HAL_Delay(500);
+    }
+}
+
+
+/* ============================================================
+   DWT TIMER
+   ============================================================ */
+
+void DWT_Init(void)
+{
+    CoreDebug->DEMCR |=
+        CoreDebug_DEMCR_TRCENA_Msk;
+
+    DWT->CYCCNT = 0;
+
+    DWT->CTRL |=
+        DWT_CTRL_CYCCNTENA_Msk;
+}
+
+
+uint32_t DWT_GetMicros(void)
+{
+    return DWT->CYCCNT /
+           (SystemCoreClock / 1000000U);
+}
+
+
+/* ============================================================
+   FLOAT PRINT
+   ============================================================ */
+
+void PrintFloat2(float value)
+{
+    int32_t scaled;
+
+    if (value < 0.0f)
+    {
+        printf("-");
+
+        value = -value;
+    }
+
+    scaled =
+        (int32_t)(value * 100.0f + 0.5f);
+
+    printf("%ld.%02ld",
+           (long)(scaled / 100),
+           (long)(scaled % 100));
+}
+
+
+void PrintFloat3(float value)
+{
+    int32_t scaled;
+
+    if (value < 0.0f)
+    {
+        printf("-");
+
+        value = -value;
+    }
+
+    scaled =
+        (int32_t)(value * 1000.0f + 0.5f);
+
+    printf("%ld.%03ld",
+           (long)(scaled / 1000),
+           (long)(scaled % 1000));
+}
+
+
+/* ============================================================
+   JSN-SR04T
+   ============================================================ */
+
+uint8_t JSN_ReadDistance(float *distance)
+{
+    uint32_t start;
+    uint32_t echo_start;
+    uint32_t echo_end;
+
+    uint32_t echo_time;
+
+
+    HAL_GPIO_WritePin(
+        JSN_TRIG_PORT,
+        JSN_TRIG_PIN,
+        GPIO_PIN_RESET);
+
+    HAL_Delay(1);
+
+
+    HAL_GPIO_WritePin(
+        JSN_TRIG_PORT,
+        JSN_TRIG_PIN,
+        GPIO_PIN_SET);
+
+
+    uint32_t trig_start =
+        DWT_GetMicros();
+
+    while ((DWT_GetMicros() -
+            trig_start) < 10)
+    {
+    }
+
+
+    HAL_GPIO_WritePin(
+        JSN_TRIG_PORT,
+        JSN_TRIG_PIN,
+        GPIO_PIN_RESET);
+
+
+    /* WAIT ECHO HIGH */
+
+    start = DWT_GetMicros();
+
+    while (HAL_GPIO_ReadPin(
+               JSN_ECHO_PORT,
+               JSN_ECHO_PIN) ==
+           GPIO_PIN_RESET)
+    {
+        if ((DWT_GetMicros() -
+             start) > 40000)
+        {
+            return 0;
+        }
+    }
+
+
+    echo_start =
+        DWT_GetMicros();
+
+
+    /* WAIT ECHO LOW */
+
+    start =
+        DWT_GetMicros();
+
+    while (HAL_GPIO_ReadPin(
+               JSN_ECHO_PORT,
+               JSN_ECHO_PIN) ==
+           GPIO_PIN_SET)
+    {
+        if ((DWT_GetMicros() -
+             start) > 40000)
+        {
+            return 0;
+        }
+    }
+
+
+    echo_end =
+        DWT_GetMicros();
+
+
+    echo_time =
+        echo_end - echo_start;
+
+
+    *distance =
+        ((float)echo_time) / 58.0f;
+
+
+    if (*distance <
+            JSN_MIN_DISTANCE_CM ||
+        *distance >
+            JSN_MAX_DISTANCE_CM)
+    {
+        return 0;
+    }
+
+
+    return 1;
+}
+
+
+/* ============================================================
+   FILTERED DISTANCE
+   ============================================================ */
+
+float JSN_ReadFilteredDistance(
+    uint8_t *valid_count)
+{
+    float samples[JSN_SAMPLES];
+
+    uint8_t count = 0;
+
+
+    for (uint8_t i = 0;
+         i < JSN_SAMPLES;
+         i++)
+    {
+        float distance;
+
+
+        if (JSN_ReadDistance(&distance))
+        {
+            samples[count] =
+                distance;
+
+            count++;
+
+
+            printf("[JSN] Valid reading: ");
+
+            PrintFloat2(distance);
+
+            printf(" cm\r\n");
+        }
+        else
+        {
+            printf("[JSN] Invalid reading\r\n");
+        }
+
+
+        HAL_Delay(60);
+    }
+
+
+    *valid_count =
+        count;
+
+
+    if (count == 0)
+    {
+        return 0.0f;
+    }
+
+
+    /* SORT */
+
+    for (uint8_t i = 0;
+         i < count;
+         i++)
+    {
+        for (uint8_t j = i + 1;
+             j < count;
+             j++)
+        {
+            if (samples[j] <
+                samples[i])
+            {
+                float temp =
+                    samples[i];
+
+                samples[i] =
+                    samples[j];
+
+                samples[j] =
+                    temp;
+            }
+        }
+    }
+
+
+    /* MEDIAN */
+
+    if (count % 2)
+    {
+        return samples[count / 2];
+    }
+    else
+    {
+        return
+            (samples[count / 2 - 1] +
+             samples[count / 2]) / 2.0f;
+    }
+}
+
+
+/* ============================================================
+   WATER UPDATE
+   ============================================================ */
+
+void UpdateWaterSensor(void)
+{
+    static uint8_t have_previous = 0;
+
+    static uint32_t previous_time = 0;
+
+
+    uint8_t valid_count;
+
+
+    float distance =
+        JSN_ReadFilteredDistance(
+            &valid_count);
+
+
+    printf("[JSN] Valid readings: %d/5\r\n",
+           valid_count);
+
+
+    /* SENSOR FAILURE */
+
+    if (valid_count <
+        JSN_VALID_REQUIRED)
+    {
+        if (water_bad_cycles <
+            SENSOR_FAULT_CYCLES)
+        {
+            water_bad_cycles++;
+        }
+
+        water_good_cycles = 0;
+
+
+        if (water_bad_cycles >=
+            SENSOR_FAULT_CYCLES)
+        {
+            water_health = 0;
+
+            water_trend =
+                WATER_SENSOR_FAULT;
+        }
+
+        return;
+    }
+
+
+    /* SENSOR GOOD */
+
+    water_bad_cycles = 0;
+
+
+    if (water_good_cycles <
+        SENSOR_RECOVERY_CYCLES)
+    {
+        water_good_cycles++;
+    }
+
+
+    if (water_good_cycles >=
+        SENSOR_RECOVERY_CYCLES ||
+        water_health == 0)
+    {
+        water_health = 1;
+    }
+
+
+    current_distance =
+        distance;
+
+
+    printf("[JSN] Filtered distance: ");
+
+    PrintFloat2(distance);
+
+    printf(" cm\r\n");
+
+
+    /* WATER LEVEL */
+
+    float new_level =
+        WATER_REFERENCE_CM -
+        distance;
+
+
+    if (new_level < 0.0f)
+    {
+        new_level = 0.0f;
+    }
+
+
+    current_water_level =
+        new_level;
+
+
+    printf("[WATER] Level: ");
+
+    PrintFloat2(current_water_level);
+
+    printf(" cm\r\n");
+
+
+    /* RATE */
+
+    uint32_t now =
+        HAL_GetTick();
+
+
+    /*
+     * IMPORTANT:
+     * Do NOT calculate rate on the first
+     * valid measurement.
+     */
+
+    if (have_previous)
+    {
+        uint32_t dt_ms =
+            now - previous_time;
+
+
+        if (dt_ms > 100)
+        {
+            float dt_min =
+                ((float)dt_ms) /
+                60000.0f;
+
+
+            water_rate =
+                (current_water_level -
+                 previous_water_level) /
+                dt_min;
+        }
+    }
+    else
+    {
+        water_rate = 0.0f;
+
+        have_previous = 1;
+    }
+
+
+    previous_water_level =
+        current_water_level;
+
+    previous_time =
+        now;
+
+
+    printf("[WATER] Rate: ");
+
+    PrintFloat2(water_rate);
+
+    printf(" cm/min\r\n");
+
+
+    /* TREND */
+
+    if (water_rate >
+        WATER_RAPID_THRESHOLD)
+    {
+        water_trend =
+            WATER_RAPID_RISING;
+    }
+    else if (water_rate >
+             WATER_RISING_THRESHOLD)
+    {
+        water_trend =
+            WATER_RISING;
+    }
+    else if (water_rate <
+             -WATER_RISING_THRESHOLD)
+    {
+        water_trend =
+            WATER_FALLING;
+    }
+    else
+    {
+        water_trend =
+            WATER_STABLE;
+    }
+}
+
+
+/* ============================================================
+   MPU6050 READ
+   ============================================================ */
+
+uint8_t MPU6050_Read(
+    uint8_t reg,
+    uint8_t *data,
+    uint16_t len)
+{
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU6050_ADDR,
+            reg,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            len,
+            100) == HAL_OK)
+    {
+        return 1;
+    }
+
+
+    return 0;
+}
+
+
+/* ============================================================
+   MPU6050 INIT
+   ============================================================ */
+
+uint8_t MPU6050_Init(void)
+{
+    uint8_t who_am_i;
+
+    uint8_t data;
+
+
+    HAL_Delay(100);
+
+
+    /* WAKE UP */
+
+    data = 0x00;
+
+
+    if (HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU6050_ADDR,
+            MPU6050_PWR_MGMT_1,
+            I2C_MEMADD_SIZE_8BIT,
+            &data,
+            1,
+            100) != HAL_OK)
+    {
+        return 0;
+    }
+
+
+    HAL_Delay(100);
+
+
+    /* WHO AM I */
+
+    if (!MPU6050_Read(
+            MPU6050_WHO_AM_I,
+            &who_am_i,
+            1))
+    {
+        return 0;
+    }
+
+
+    printf("MPU6050 WHO_AM_I = 0x%02X\r\n",
+           who_am_i);
+
+
+    if (who_am_i != 0x68 &&
+        who_am_i != 0x70)
+    {
+        return 0;
+    }
+
+
+    /* SAMPLE RATE */
+
+    data = 0x04;
+
+
+    HAL_I2C_Mem_Write(
+        &hi2c1,
+        MPU6050_ADDR,
+        MPU6050_SMPLRT_DIV,
+        I2C_MEMADD_SIZE_8BIT,
+        &data,
+        1,
+        100);
+
+
+    /* DLPF */
+
+    data = 0x03;
+
+
+    HAL_I2C_Mem_Write(
+        &hi2c1,
+        MPU6050_ADDR,
+        MPU6050_CONFIG,
+        I2C_MEMADD_SIZE_8BIT,
+        &data,
+        1,
+        100);
+
+
+    /* ±2g */
+
+    data = 0x00;
+
+
+    HAL_I2C_Mem_Write(
+        &hi2c1,
+        MPU6050_ADDR,
+        MPU6050_ACCEL_CONFIG,
+        I2C_MEMADD_SIZE_8BIT,
+        &data,
+        1,
+        100);
+
+
+    return 1;
+}
+
+
+/* ============================================================
+   VIBRATION UPDATE
+   ============================================================ */
+
+void UpdateVibrationSensor(void)
+{
+    float ax[VIBRATION_SAMPLES];
+
+    float ay[VIBRATION_SAMPLES];
+
+    float az[VIBRATION_SAMPLES];
+
+
+    float mean_x = 0.0f;
+
+    float mean_y = 0.0f;
+
+    float mean_z = 0.0f;
+
+
+    uint8_t buffer[6];
+
+    uint8_t valid_samples = 0;
+
+
+    /* COLLECT */
+
+    for (uint8_t i = 0;
+         i < VIBRATION_SAMPLES;
+         i++)
+    {
+        if (MPU6050_Read(
+                MPU6050_ACCEL_XOUT_H,
+                buffer,
+                6))
+        {
+            int16_t raw_x =
+                (int16_t)
+                ((buffer[0] << 8) |
+                 buffer[1]);
+
+
+            int16_t raw_y =
+                (int16_t)
+                ((buffer[2] << 8) |
+                 buffer[3]);
+
+
+            int16_t raw_z =
+                (int16_t)
+                ((buffer[4] << 8) |
+                 buffer[5]);
+
+
+            ax[valid_samples] =
+                ((float)raw_x) /
+                16384.0f;
+
+
+            ay[valid_samples] =
+                ((float)raw_y) /
+                16384.0f;
+
+
+            az[valid_samples] =
+                ((float)raw_z) /
+                16384.0f;
+
+
+            mean_x +=
+                ax[valid_samples];
+
+            mean_y +=
+                ay[valid_samples];
+
+            mean_z +=
+                az[valid_samples];
+
+
+            valid_samples++;
+        }
+
+
+        HAL_Delay(50);
+    }
+
+
+    /* FAILURE */
+
+    if (valid_samples < 10)
+    {
+        if (vibration_bad_cycles <
+            SENSOR_FAULT_CYCLES)
+        {
+            vibration_bad_cycles++;
+        }
+
+
+        vibration_good_cycles = 0;
+
+
+        if (vibration_bad_cycles >=
+            SENSOR_FAULT_CYCLES)
+        {
+            vibration_health = 0;
+
+            vibration_state =
+                VIB_SENSOR_FAULT;
+        }
+
+
+        printf("[MPU] Communication problem.\r\n");
+
+        return;
+    }
+
+
+    /* RECOVERY */
+
+    vibration_bad_cycles = 0;
+
+
+    if (vibration_good_cycles <
+        SENSOR_RECOVERY_CYCLES)
+    {
+        vibration_good_cycles++;
+    }
+
+
+    if (vibration_good_cycles >=
+        SENSOR_RECOVERY_CYCLES ||
+        vibration_health == 0)
+    {
+        vibration_health = 1;
+    }
+
+
+    mean_x /=
+        valid_samples;
+
+    mean_y /=
+        valid_samples;
+
+    mean_z /=
+        valid_samples;
+
+
+    /* RMS */
+
+    float sum_square = 0.0f;
+
+
+    for (uint8_t i = 0;
+         i < valid_samples;
+         i++)
+    {
+        float dx =
+            ax[i] - mean_x;
+
+        float dy =
+            ay[i] - mean_y;
+
+        float dz =
+            az[i] - mean_z;
+
+
+        sum_square +=
+            (dx * dx) +
+            (dy * dy) +
+            (dz * dz);
+    }
+
+
+    vibration_rms =
+        sqrtf(sum_square /
+              (3.0f *
+               valid_samples));
+
+
+    /* STATE */
+
+    if (vibration_rms >=
+        VIB_HIGH_THRESHOLD)
+    {
+        vibration_state =
+            VIB_HIGH;
+    }
+    else if (vibration_rms >=
+             VIB_LOW_THRESHOLD)
+    {
+        vibration_state =
+            VIB_MEDIUM;
+    }
+    else
+    {
+        vibration_state =
+            VIB_LOW;
+    }
+
+
+    printf("[MPU] Vibration RMS: ");
+
+    PrintFloat3(vibration_rms);
+
+    printf(" g\r\n");
+}
+
+
+/* ============================================================
+   FUSION
+   ============================================================ */
+
+void UpdateFusion(void)
+{
+    /* SENSOR FAULT */
+
+    if (!water_health ||
+        !vibration_health)
+    {
+        fusion_state =
+            FUSION_SENSOR_FAULT;
+
+        hazard_count = 0;
+
+        normal_count = 0;
+
+        return;
+    }
+
+
+    uint8_t hazard = 0;
+
+
+    /* RAPID WATER RISE */
+
+    if (water_trend ==
+        WATER_RAPID_RISING)
+    {
+        if (vibration_state ==
+                VIB_MEDIUM ||
+            vibration_state ==
+                VIB_HIGH)
+        {
+            hazard = 3;
+        }
+        else
+        {
+            hazard = 2;
+        }
+    }
+
+
+    /* NORMAL RISING */
+
+    else if (water_trend ==
+             WATER_RISING)
+    {
+        if (vibration_state ==
+            VIB_HIGH)
+        {
+            hazard = 2;
+        }
+        else if (vibration_state ==
+                 VIB_MEDIUM)
+        {
+            hazard = 1;
+        }
+    }
+
+
+    /* STABLE/FALLING */
+
+    else
+    {
+        if (vibration_state ==
+                VIB_HIGH ||
+            vibration_state ==
+                VIB_MEDIUM)
+        {
+            hazard = 1;
+        }
+    }
+
+
+    /* PERSISTENCE */
+
+    if (hazard > 0)
+    {
+        normal_count = 0;
+
+
+        if (hazard_count <
+            HAZARD_PERSISTENCE)
+        {
+            hazard_count++;
+        }
+    }
+    else
+    {
+        hazard_count = 0;
+
+
+        if (normal_count <
+            NORMAL_PERSISTENCE)
+        {
+            normal_count++;
+        }
+    }
+
+
+    /* STATE */
+
+    if (hazard_count >=
+        HAZARD_PERSISTENCE)
+    {
+        if (hazard >= 3)
+        {
+            fusion_state =
+                FUSION_CRITICAL;
+        }
+        else if (hazard == 2)
+        {
+            fusion_state =
+                FUSION_WARNING;
+        }
+        else
+        {
+            fusion_state =
+                FUSION_WATCH;
+        }
+    }
+    else if (normal_count >=
+             NORMAL_PERSISTENCE)
+    {
+        fusion_state =
+            FUSION_NORMAL;
+    }
+}
+
+
+/* ============================================================
+   SX1278 SPI
+   ============================================================ */
+
+void LoRa_Select(void)
+{
+    HAL_GPIO_WritePin(
+        LORA_NSS_PORT,
+        LORA_NSS_PIN,
+        GPIO_PIN_RESET);
+}
+
+
+void LoRa_Unselect(void)
+{
+    HAL_GPIO_WritePin(
+        LORA_NSS_PORT,
+        LORA_NSS_PIN,
+        GPIO_PIN_SET);
+}
+
+
+/* ============================================================
+   READ REGISTER
+   ============================================================ */
+
+uint8_t LoRa_ReadRegister(
+    uint8_t address)
+{
+    uint8_t tx[2];
+
+    uint8_t rx[2];
+
+
+    tx[0] =
+        address & 0x7F;
+
+    tx[1] = 0x00;
+
+
+    rx[0] = 0;
+    rx[1] = 0;
+
+
+    LoRa_Select();
+
+
+    HAL_SPI_TransmitReceive(
+        &hspi1,
+        tx,
+        rx,
+        2,
+        100);
+
+
+    LoRa_Unselect();
+
+
+    return rx[1];
+}
+
+
+/* ============================================================
+   WRITE REGISTER
+   ============================================================ */
+
+void LoRa_WriteRegister(
+    uint8_t address,
+    uint8_t value)
+{
+    uint8_t tx[2];
+
+
+    tx[0] =
+        address | 0x80;
+
+    tx[1] =
+        value;
+
+
+    LoRa_Select();
+
+
+    HAL_SPI_Transmit(
+        &hspi1,
+        tx,
+        2,
+        100);
+
+
+    LoRa_Unselect();
+}
+
+
+/* ============================================================
+   RESET SX1278
+   ============================================================ */
+
+void LoRa_Reset(void)
+{
+    HAL_GPIO_WritePin(
+        LORA_RESET_PORT,
+        LORA_RESET_PIN,
+        GPIO_PIN_RESET);
+
+    HAL_Delay(10);
+
+    HAL_GPIO_WritePin(
+        LORA_RESET_PORT,
+        LORA_RESET_PIN,
+        GPIO_PIN_SET);
+
+    HAL_Delay(20);
+}
+
+
+/* ============================================================
+   SET FREQUENCY
+   ============================================================ */
+
+void LoRa_SetFrequency(
+    uint32_t frequency)
+{
+    /*
+     * FRF = frequency / 61.03515625 Hz
+     */
+
+    uint64_t frf =
+        ((uint64_t)frequency << 19) /
+        32000000UL;
+
+
+    LoRa_WriteRegister(
+        REG_FRF_MSB,
+        (uint8_t)(frf >> 16));
+
+
+    LoRa_WriteRegister(
+        REG_FRF_MID,
+        (uint8_t)(frf >> 8));
+
+
+    LoRa_WriteRegister(
+        REG_FRF_LSB,
+        (uint8_t)frf);
+}
+
+
+/* ============================================================
+   SET TX POWER
+   ============================================================ */
+
+void LoRa_SetTxPower(
+    uint8_t power)
+{
+    if (power < 2)
+    {
+        power = 2;
+    }
+
+
+    if (power > 17)
+    {
+        power = 17;
+    }
+
+
+    /*
+     * PA_BOOST:
+     *
+     * Output = 2 + OutputPower
+     */
+
+    uint8_t output =
+        power - 2;
+
+
+    LoRa_WriteRegister(
+        REG_PA_CONFIG,
+        0x80 | output);
+
+
+    /*
+     * Maximum current
+     */
+
+    LoRa_WriteRegister(
+        REG_OCP,
+        0x2B);
+}
+
+
+/* ============================================================
+   SX1278 INITIALIZATION
+   ============================================================ */
+
+uint8_t LoRa_Init(void)
+{
+    uint8_t version;
+
+
+    LoRa_Reset();
+
+
+    /* Sleep + LoRa mode */
+
+    LoRa_WriteRegister(
+        REG_OP_MODE,
+        MODE_LONG_RANGE_MODE |
+        MODE_SLEEP);
+
+    HAL_Delay(10);
+
+
+    version =
+        LoRa_ReadRegister(
+            REG_VERSION);
+
+
+    printf("SX1278 Version = 0x%02X\r\n",
+           version);
+
+
+    /*
+     * SX1278 expected:
+     * 0x12
+     */
+
+    if (version != 0x12)
+    {
+        return 0;
+    }
+
+
+    /* STANDBY */
+
+    LoRa_WriteRegister(
+        REG_OP_MODE,
+        MODE_LONG_RANGE_MODE |
+        MODE_STDBY);
+
+
+    HAL_Delay(10);
+
+
+    /* FREQUENCY */
+
+    LoRa_SetFrequency(
+        LORA_FREQUENCY_HZ);
+
+
+    /* FIFO TX BASE */
+
+    LoRa_WriteRegister(
+        REG_FIFO_TX_BASE_ADDR,
+        0x00);
+
+
+    /* FIFO RX BASE */
+
+    LoRa_WriteRegister(
+        REG_FIFO_RX_BASE_ADDR,
+        0x00);
+
+
+    /* PA */
+
+    LoRa_SetTxPower(
+        LORA_TX_POWER);
+
+
+    /*
+     * LNA boost
+     */
+
+    LoRa_WriteRegister(
+        REG_LNA,
+        0x23);
+
+
+    /*
+     * Modem configuration 1:
+     *
+     * BW = 125 kHz
+     * CR = 4/5
+     * Explicit header
+     */
+
+    LoRa_WriteRegister(
+        REG_MODEM_CONFIG1,
+        0x72);
+
+
+    /*
+     * Modem configuration 2:
+     *
+     * SF7
+     * CRC ON
+     */
+
+    LoRa_WriteRegister(
+        REG_MODEM_CONFIG2,
+        0x74);
+
+
+    /*
+     * Modem configuration 3:
+     *
+     * Low data rate optimization OFF
+     * AGC ON
+     */
+
+    LoRa_WriteRegister(
+        REG_MODEM_CONFIG3,
+        0x04);
+
+
+    /*
+     * Preamble = 8
+     */
+
+    LoRa_WriteRegister(
+        REG_PREAMBLE_MSB,
+        0x00);
+
+    LoRa_WriteRegister(
+        REG_PREAMBLE_LSB,
+        0x08);
+
+
+    /*
+     * DIO0 = TxDone
+     */
+
+    LoRa_WriteRegister(
+        REG_DIO_MAPPING1,
+        0x40);
+
+
+    /*
+     * Clear IRQ
+     */
+
+    LoRa_WriteRegister(
+        REG_IRQ_FLAGS,
+        0xFF);
+
+
+    /*
+     * STANDBY
+     */
+
+    LoRa_WriteRegister(
+        REG_OP_MODE,
+        MODE_LONG_RANGE_MODE |
+        MODE_STDBY);
+
+
+    HAL_Delay(10);
+
+
+    return 1;
+}
+
+
+/* ============================================================
+   LORA SEND PACKET
+   ============================================================ */
+
+uint8_t LoRa_SendPacket(
+    uint8_t *data,
+    uint8_t length)
+{
+    uint32_t start;
+
+
+    if (length == 0 ||
+        length > 255)
+    {
+        return 0;
+    }
+
+
+    /*
+     * STANDBY
+     */
+
+    LoRa_WriteRegister(
+        REG_OP_MODE,
+        MODE_LONG_RANGE_MODE |
+        MODE_STDBY);
+
+
+    /*
+     * FIFO pointer = TX base
+     */
+
+    LoRa_WriteRegister(
+        REG_FIFO_ADDR_PTR,
+        LoRa_ReadRegister(
+            REG_FIFO_TX_BASE_ADDR));
+
+
+    /*
+     * Write packet into FIFO
+     */
+
+    for (uint8_t i = 0;
+         i < length;
+         i++)
+    {
+        LoRa_WriteRegister(
+            REG_FIFO,
+            data[i]);
+    }
+
+
+    /*
+     * Payload length
+     */
+
+    LoRa_WriteRegister(
+        REG_PAYLOAD_LENGTH,
+        length);
+
+
+    /*
+     * Clear IRQ flags
+     */
+
+    LoRa_WriteRegister(
+        REG_IRQ_FLAGS,
+        0xFF);
+
+
+    /*
+     * TX mode
+     */
+
+    LoRa_WriteRegister(
+        REG_OP_MODE,
+        MODE_LONG_RANGE_MODE |
+        MODE_TX);
+
+
+    /*
+     * Wait for TX DONE.
+     *
+     * DIO0 is also mapped to TX_DONE,
+     * but checking IRQ register makes
+     * this robust.
+     */
+
+    start =
+        HAL_GetTick();
+
+
+    while (1)
+    {
+        uint8_t irq =
+            LoRa_ReadRegister(
+                REG_IRQ_FLAGS);
+
+
+        if (irq &
+            IRQ_TX_DONE_MASK)
+        {
+            /*
+             * Clear TX DONE
+             */
+
+            LoRa_WriteRegister(
+                REG_IRQ_FLAGS,
+                IRQ_TX_DONE_MASK);
+
+
+            /*
+             * Return to standby
+             */
+
+            LoRa_WriteRegister(
+                REG_OP_MODE,
+                MODE_LONG_RANGE_MODE |
+                MODE_STDBY);
+
+
+            return 1;
+        }
+
+
+        /*
+         * Timeout = 5 seconds
+         */
+
+        if ((HAL_GetTick() -
+             start) > 5000)
+        {
+            LoRa_WriteRegister(
+                REG_OP_MODE,
+                MODE_LONG_RANGE_MODE |
+                MODE_STDBY);
+
+
+            return 0;
+        }
+    }
+}
+
+
+/* ============================================================
+   STRING FUNCTIONS
+   ============================================================ */
+
+const char *WaterTrendString(
+    WaterTrend_t state)
+{
+    switch (state)
+    {
+        case WATER_STABLE:
+            return "STABLE";
+
+        case WATER_RISING:
+            return "RISING";
+
+        case WATER_RAPID_RISING:
+            return "RAPID RISING";
+
+        case WATER_FALLING:
+            return "FALLING";
+
+        case WATER_SENSOR_FAULT:
+            return "SENSOR FAULT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+const char *VibrationString(
+    VibrationState_t state)
+{
+    switch (state)
+    {
+        case VIB_LOW:
+            return "LOW";
+
+        case VIB_MEDIUM:
+            return "MEDIUM";
+
+        case VIB_HIGH:
+            return "HIGH";
+
+        case VIB_SENSOR_FAULT:
+            return "SENSOR FAULT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+const char *FusionString(
+    FusionState_t state)
+{
+    switch (state)
+    {
+        case FUSION_NORMAL:
+            return "NORMAL";
+
+        case FUSION_WATCH:
+            return "WATCH";
+
+        case FUSION_WARNING:
+            return "WARNING";
+
+        case FUSION_CRITICAL:
+            return "CRITICAL";
+
+        case FUSION_SENSOR_FAULT:
+            return "SENSOR FAULT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+/* ============================================================
+   UART RETARGET
+   ============================================================ */
+
+int _write(int file,
+           char *ptr,
+           int len)
+{
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)ptr,
+        len,
+        HAL_MAX_DELAY);
+
+    return len;
+}
+
+
+/* ============================================================
+   I2C1
+   ============================================================ */
+
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance = I2C1;
+
+    hi2c1.Init.ClockSpeed = 100000;
+
+    hi2c1.Init.DutyCycle =
+        I2C_DUTYCYCLE_2;
+
+    hi2c1.Init.OwnAddress1 = 0;
+
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+
+    hi2c1.Init.OwnAddress2 = 0;
+
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+
+
+    if (HAL_I2C_Init(&hi2c1)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* ============================================================
+   SPI1
+   ============================================================ */
+
+static void MX_SPI1_Init(void)
+{
+    hspi1.Instance = SPI1;
+
+    hspi1.Init.Mode =
+        SPI_MODE_MASTER;
+
+    hspi1.Init.Direction =
+        SPI_DIRECTION_2LINES;
+
+    hspi1.Init.DataSize =
+        SPI_DATASIZE_8BIT;
+
+    hspi1.Init.CLKPolarity =
+        SPI_POLARITY_LOW;
+
+    hspi1.Init.CLKPhase =
+        SPI_PHASE_1EDGE;
+
+    hspi1.Init.NSS =
+        SPI_NSS_SOFT;
+
+    hspi1.Init.BaudRatePrescaler =
+        SPI_BAUDRATEPRESCALER_16;
+
+    hspi1.Init.FirstBit =
+        SPI_FIRSTBIT_MSB;
+
+    hspi1.Init.TIMode =
+        SPI_TIMODE_DISABLE;
+
+    hspi1.Init.CRCCalculation =
+        SPI_CRCCALCULATION_DISABLE;
+
+    hspi1.Init.CRCPolynomial =
+        10;
+
+
+    if (HAL_SPI_Init(&hspi1)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* ============================================================
+   USART2
+   ============================================================ */
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance =
+        USART2;
+
+    huart2.Init.BaudRate =
+        115200;
+
+    huart2.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart2.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart2.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart2.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart2.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart2.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+
+    if (HAL_UART_Init(&huart2)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* ============================================================
+   GPIO
+   ============================================================ */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct =
+        {0};
+
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+
+    /* ---------- JSN TRIG ---------- */
+
+    GPIO_InitStruct.Pin =
+        JSN_TRIG_PIN;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_LOW;
+
+
+    HAL_GPIO_Init(
+        JSN_TRIG_PORT,
+        &GPIO_InitStruct);
+
+
+    /* ---------- JSN ECHO ---------- */
+
+    GPIO_InitStruct.Pin =
+        JSN_ECHO_PIN;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_INPUT;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+
+    HAL_GPIO_Init(
+        JSN_ECHO_PORT,
+        &GPIO_InitStruct);
+
+
+    /* ---------- LORA NSS ---------- */
+
+    GPIO_InitStruct.Pin =
+        LORA_NSS_PIN;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_HIGH;
+
+
+    HAL_GPIO_Init(
+        LORA_NSS_PORT,
+        &GPIO_InitStruct);
+
+
+    /* ---------- LORA RESET ---------- */
+
+    GPIO_InitStruct.Pin =
+        LORA_RESET_PIN;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_HIGH;
+
+
+    HAL_GPIO_Init(
+        LORA_RESET_PORT,
+        &GPIO_InitStruct);
+
+
+    /* ---------- LORA DIO0 ---------- */
+
+    GPIO_InitStruct.Pin =
+        LORA_DIO0_PIN;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_INPUT;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+
+    HAL_GPIO_Init(
+        LORA_DIO0_PORT,
+        &GPIO_InitStruct);
+
+
+    /* Initial states */
+
+    HAL_GPIO_WritePin(
+        JSN_TRIG_PORT,
+        JSN_TRIG_PIN,
+        GPIO_PIN_RESET);
+
+
+    HAL_GPIO_WritePin(
+        LORA_NSS_PORT,
+        LORA_NSS_PIN,
+        GPIO_PIN_SET);
+
+
+    HAL_GPIO_WritePin(
+        LORA_RESET_PORT,
+        LORA_RESET_PIN,
+        GPIO_PIN_SET);
+}
+
+
+/* ============================================================
+   SYSTEM CLOCK
+   ============================================================ */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef
+        RCC_OscInitStruct = {0};
+
+    RCC_ClkInitTypeDef
+        RCC_ClkInitStruct = {0};
+
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+
+
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE1);
+
+
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSI;
+
+    RCC_OscInitStruct.HSIState =
+        RCC_HSI_ON;
+
+    RCC_OscInitStruct.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_ON;
+
+    RCC_OscInitStruct.PLL.PLLSource =
+        RCC_PLLSOURCE_HSI;
+
+    RCC_OscInitStruct.PLL.PLLM =
+        16;
+
+    RCC_OscInitStruct.PLL.PLLN =
+        180;
+
+    RCC_OscInitStruct.PLL.PLLP =
+        RCC_PLLP_DIV2;
+
+    RCC_OscInitStruct.PLL.PLLQ =
+        2;
+
+
+    if (HAL_RCC_OscConfig(
+            &RCC_OscInitStruct)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+
+    if (HAL_PWREx_EnableOverDrive()
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV4;
+
+
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV2;
+
+
+    if (HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_5)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
+/* ============================================================
+   ERROR HANDLER
+   ============================================================ */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
