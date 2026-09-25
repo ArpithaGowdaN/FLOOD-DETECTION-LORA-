@@ -259,6 +259,9 @@ void PrintFloat3(float value);
 
 uint8_t MPU6050_Init(void);
 
+uint8_t MPU6050_CheckConnection(void);
+void MPU6050_I2C_Recover(void);
+
 uint8_t MPU6050_Read(uint8_t reg,
                      uint8_t *data,
                      uint16_t len);
@@ -351,6 +354,8 @@ int main(void)
         printf("MPU6050 initialization SUCCESS.\r\n");
 
         vibration_health = 1;
+        vibration_bad_cycles = 0;
+        vibration_good_cycles = SENSOR_RECOVERY_CYCLES;
     }
     else
     {
@@ -995,8 +1000,7 @@ void UpdateWaterSensor(void)
 
 
     if (water_good_cycles >=
-        SENSOR_RECOVERY_CYCLES ||
-        water_health == 0)
+        SENSOR_RECOVERY_CYCLES)
     {
         water_health = 1;
     }
@@ -1148,107 +1152,153 @@ uint8_t MPU6050_Read(
    MPU6050 INIT
    ============================================================ */
 
-uint8_t MPU6050_Init(void)
+uint8_t MPU6050_CheckConnection(void)
 {
-    uint8_t who_am_i;
+    uint8_t who_am_i = 0;
+    HAL_StatusTypeDef status;
 
-    uint8_t data;
+    status = HAL_I2C_Mem_Read(
+        &hi2c1,
+        MPU6050_ADDR,
+        MPU6050_WHO_AM_I,
+        I2C_MEMADD_SIZE_8BIT,
+        &who_am_i,
+        1,
+        200);
 
-
-    HAL_Delay(100);
-
-
-    /* WAKE UP */
-
-    data = 0x00;
-
-
-    if (HAL_I2C_Mem_Write(
-            &hi2c1,
-            MPU6050_ADDR,
-            MPU6050_PWR_MGMT_1,
-            I2C_MEMADD_SIZE_8BIT,
-            &data,
-            1,
-            100) != HAL_OK)
+    if (status != HAL_OK)
     {
+        printf("[MPU] WHO_AM_I READ FAILED. HAL STATUS = %d\r\n", status);
         return 0;
     }
 
+    printf("[MPU] WHO_AM_I = 0x%02X\r\n", who_am_i);
 
-    HAL_Delay(100);
-
-
-    /* WHO AM I */
-
-    if (!MPU6050_Read(
-            MPU6050_WHO_AM_I,
-            &who_am_i,
-            1))
+    if (who_am_i == 0x68 || who_am_i == 0x70)
     {
-        return 0;
+        return 1;
     }
 
-
-    printf("MPU6050 WHO_AM_I = 0x%02X\r\n",
-           who_am_i);
-
-
-    if (who_am_i != 0x68 &&
-        who_am_i != 0x70)
-    {
-        return 0;
-    }
-
-
-    /* SAMPLE RATE */
-
-    data = 0x04;
-
-
-    HAL_I2C_Mem_Write(
-        &hi2c1,
-        MPU6050_ADDR,
-        MPU6050_SMPLRT_DIV,
-        I2C_MEMADD_SIZE_8BIT,
-        &data,
-        1,
-        100);
-
-
-    /* DLPF */
-
-    data = 0x03;
-
-
-    HAL_I2C_Mem_Write(
-        &hi2c1,
-        MPU6050_ADDR,
-        MPU6050_CONFIG,
-        I2C_MEMADD_SIZE_8BIT,
-        &data,
-        1,
-        100);
-
-
-    /* ±2g */
-
-    data = 0x00;
-
-
-    HAL_I2C_Mem_Write(
-        &hi2c1,
-        MPU6050_ADDR,
-        MPU6050_ACCEL_CONFIG,
-        I2C_MEMADD_SIZE_8BIT,
-        &data,
-        1,
-        100);
-
-
-    return 1;
+    printf("[MPU] Unexpected WHO_AM_I value.\r\n");
+    return 0;
 }
 
+
+/* ============================================================
+   MPU6050 I2C RECOVERY
+   ============================================================ */
+
+void MPU6050_I2C_Recover(void)
+{
+    printf("[MPU] Resetting I2C1 peripheral...\r\n");
+
+    HAL_I2C_DeInit(&hi2c1);
+    HAL_Delay(20);
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        printf("[MPU] I2C1 reinitialization FAILED.\r\n");
+    }
+    else
+    {
+        printf("[MPU] I2C1 reinitialization complete.\r\n");
+    }
+}
+
+/* ============================================================
+   MPU6050 INIT
+   ============================================================ */
+
+uint8_t MPU6050_Init(void)
+{
+    uint8_t who_am_i = 0;
+    uint8_t data = 0;
+
+    HAL_Delay(100);
+
+    /* Check device first */
+    if (!MPU6050_Read(MPU6050_WHO_AM_I, &who_am_i, 1))
+    {
+        printf("[MPU] WHO_AM_I read FAILED.\r\n");
+        return 0;
+    }
+
+    printf("[MPU] WHO_AM_I = 0x%02X\r\n", who_am_i);
+
+    if (who_am_i != 0x68 && who_am_i != 0x70)
+    {
+        printf("[MPU] Invalid WHO_AM_I.\r\n");
+        return 0;
+    }
+
+    /* WAKE UP */
+    data = 0x00;
+    if (HAL_I2C_Mem_Write(&hi2c1,
+                          MPU6050_ADDR,
+                          MPU6050_PWR_MGMT_1,
+                          I2C_MEMADD_SIZE_8BIT,
+                          &data,
+                          1,
+                          100) != HAL_OK)
+    {
+        printf("[MPU] PWR_MGMT_1 write FAILED.\r\n");
+        return 0;
+    }
+
+    HAL_Delay(50);
+
+    /* SAMPLE RATE */
+    data = 0x04;
+    if (HAL_I2C_Mem_Write(&hi2c1,
+                          MPU6050_ADDR,
+                          MPU6050_SMPLRT_DIV,
+                          I2C_MEMADD_SIZE_8BIT,
+                          &data,
+                          1,
+                          100) != HAL_OK)
+    {
+        printf("[MPU] SMPLRT_DIV write FAILED.\r\n");
+        return 0;
+    }
+
+    /* DLPF */
+    data = 0x03;
+    if (HAL_I2C_Mem_Write(&hi2c1,
+                          MPU6050_ADDR,
+                          MPU6050_CONFIG,
+                          I2C_MEMADD_SIZE_8BIT,
+                          &data,
+                          1,
+                          100) != HAL_OK)
+    {
+        printf("[MPU] CONFIG write FAILED.\r\n");
+        return 0;
+    }
+
+    /* Accelerometer range = +/-2g */
+    data = 0x00;
+    if (HAL_I2C_Mem_Write(&hi2c1,
+                          MPU6050_ADDR,
+                          MPU6050_ACCEL_CONFIG,
+                          I2C_MEMADD_SIZE_8BIT,
+                          &data,
+                          1,
+                          100) != HAL_OK)
+    {
+        printf("[MPU] ACCEL_CONFIG write FAILED.\r\n");
+        return 0;
+    }
+
+    /* Final connection check */
+    if (!MPU6050_CheckConnection())
+    {
+        printf("[MPU] Device disappeared after initialization.\r\n");
+        return 0;
+    }
+
+    printf("[MPU] Initialization complete.\r\n");
+    return 1;
+}
 
 /* ============================================================
    VIBRATION UPDATE
@@ -1257,206 +1307,171 @@ uint8_t MPU6050_Init(void)
 void UpdateVibrationSensor(void)
 {
     float ax[VIBRATION_SAMPLES];
-
     float ay[VIBRATION_SAMPLES];
-
     float az[VIBRATION_SAMPLES];
 
-
     float mean_x = 0.0f;
-
     float mean_y = 0.0f;
-
     float mean_z = 0.0f;
 
-
     uint8_t buffer[6];
-
     uint8_t valid_samples = 0;
 
+    /* Never display an old RMS value while the MPU is faulty. */
+    vibration_rms = 0.0f;
 
-    /* COLLECT */
-
-    for (uint8_t i = 0;
-         i < VIBRATION_SAMPLES;
-         i++)
+    /* ========================================================
+       CONNECTION CHECK
+       ======================================================== */
+    if (!MPU6050_CheckConnection())
     {
-        if (MPU6050_Read(
-                MPU6050_ACCEL_XOUT_H,
-                buffer,
-                6))
+        printf("[MPU] Connection check FAILED.\r\n");
+
+        /* Try to recover the I2C peripheral once. */
+        MPU6050_I2C_Recover();
+
+        /* Reinitialize the MPU after I2C recovery. */
+        if (!MPU6050_Init())
         {
-            int16_t raw_x =
-                (int16_t)
-                ((buffer[0] << 8) |
-                 buffer[1]);
+            if (vibration_bad_cycles < SENSOR_FAULT_CYCLES)
+            {
+                vibration_bad_cycles++;
+            }
 
+            vibration_good_cycles = 0;
+            vibration_state = VIB_SENSOR_FAULT;
 
-            int16_t raw_y =
-                (int16_t)
-                ((buffer[2] << 8) |
-                 buffer[3]);
+            if (vibration_bad_cycles >= SENSOR_FAULT_CYCLES)
+            {
+                vibration_health = 0;
+                printf("[MPU] SENSOR FAULT CONFIRMED.\r\n");
+            }
 
+            return;
+        }
 
-            int16_t raw_z =
-                (int16_t)
-                ((buffer[4] << 8) |
-                 buffer[5]);
+        printf("[MPU] Connection recovered and MPU reinitialized.\r\n");
+    }
 
+    /* ========================================================
+       COLLECT 20 SAMPLES
+       ======================================================== */
+    for (uint8_t i = 0; i < VIBRATION_SAMPLES; i++)
+    {
+        if (MPU6050_Read(MPU6050_ACCEL_XOUT_H, buffer, 6))
+        {
+            int16_t raw_x = (int16_t)((buffer[0] << 8) | buffer[1]);
+            int16_t raw_y = (int16_t)((buffer[2] << 8) | buffer[3]);
+            int16_t raw_z = (int16_t)((buffer[4] << 8) | buffer[5]);
 
-            ax[valid_samples] =
-                ((float)raw_x) /
-                16384.0f;
+            ax[valid_samples] = ((float)raw_x) / 16384.0f;
+            ay[valid_samples] = ((float)raw_y) / 16384.0f;
+            az[valid_samples] = ((float)raw_z) / 16384.0f;
 
-
-            ay[valid_samples] =
-                ((float)raw_y) /
-                16384.0f;
-
-
-            az[valid_samples] =
-                ((float)raw_z) /
-                16384.0f;
-
-
-            mean_x +=
-                ax[valid_samples];
-
-            mean_y +=
-                ay[valid_samples];
-
-            mean_z +=
-                az[valid_samples];
-
+            mean_x += ax[valid_samples];
+            mean_y += ay[valid_samples];
+            mean_z += az[valid_samples];
 
             valid_samples++;
         }
 
-
         HAL_Delay(50);
     }
 
-
-    /* FAILURE */
-
+    /* ========================================================
+       COMMUNICATION FAILURE
+       ======================================================== */
     if (valid_samples < 10)
     {
-        if (vibration_bad_cycles <
-            SENSOR_FAULT_CYCLES)
+        vibration_rms = 0.0f;
+        vibration_state = VIB_SENSOR_FAULT;
+
+        if (vibration_bad_cycles < SENSOR_FAULT_CYCLES)
         {
             vibration_bad_cycles++;
         }
 
-
         vibration_good_cycles = 0;
 
+        printf("[MPU] Communication problem: %d/%d valid samples.\r\n",
+               valid_samples,
+               VIBRATION_SAMPLES);
 
-        if (vibration_bad_cycles >=
-            SENSOR_FAULT_CYCLES)
+        if (vibration_bad_cycles >= SENSOR_FAULT_CYCLES)
         {
             vibration_health = 0;
-
-            vibration_state =
-                VIB_SENSOR_FAULT;
+            printf("[MPU] SENSOR FAULT CONFIRMED.\r\n");
         }
-
-
-        printf("[MPU] Communication problem.\r\n");
 
         return;
     }
 
-
-    /* RECOVERY */
-
+    /* ========================================================
+       GOOD SAMPLE CYCLE / RECOVERY
+       ======================================================== */
     vibration_bad_cycles = 0;
 
-
-    if (vibration_good_cycles <
-        SENSOR_RECOVERY_CYCLES)
+    if (vibration_good_cycles < SENSOR_RECOVERY_CYCLES)
     {
         vibration_good_cycles++;
     }
 
-
-    if (vibration_good_cycles >=
-        SENSOR_RECOVERY_CYCLES ||
-        vibration_health == 0)
+    /* A previously faulted sensor must have 3 good cycles. */
+    if (vibration_good_cycles >= SENSOR_RECOVERY_CYCLES)
     {
+        if (!vibration_health)
+        {
+            printf("[MPU] SENSOR RECOVERY CONFIRMED.\r\n");
+        }
+
         vibration_health = 1;
     }
 
+    mean_x /= valid_samples;
+    mean_y /= valid_samples;
+    mean_z /= valid_samples;
 
-    mean_x /=
-        valid_samples;
-
-    mean_y /=
-        valid_samples;
-
-    mean_z /=
-        valid_samples;
-
-
-    /* RMS */
-
+    /* ========================================================
+       RMS VIBRATION
+       ======================================================== */
     float sum_square = 0.0f;
 
-
-    for (uint8_t i = 0;
-         i < valid_samples;
-         i++)
+    for (uint8_t i = 0; i < valid_samples; i++)
     {
-        float dx =
-            ax[i] - mean_x;
+        float dx = ax[i] - mean_x;
+        float dy = ay[i] - mean_y;
+        float dz = az[i] - mean_z;
 
-        float dy =
-            ay[i] - mean_y;
-
-        float dz =
-            az[i] - mean_z;
-
-
-        sum_square +=
-            (dx * dx) +
-            (dy * dy) +
-            (dz * dz);
+        sum_square += (dx * dx) + (dy * dy) + (dz * dz);
     }
 
+    vibration_rms = sqrtf(sum_square / (3.0f * valid_samples));
 
-    vibration_rms =
-        sqrtf(sum_square /
-              (3.0f *
-               valid_samples));
-
-
-    /* STATE */
-
-    if (vibration_rms >=
-        VIB_HIGH_THRESHOLD)
+    /* ========================================================
+       VIBRATION STATE
+       ======================================================== */
+    if (vibration_rms >= VIB_HIGH_THRESHOLD)
     {
-        vibration_state =
-            VIB_HIGH;
+        vibration_state = VIB_HIGH;
     }
-    else if (vibration_rms >=
-             VIB_LOW_THRESHOLD)
+    else if (vibration_rms >= VIB_LOW_THRESHOLD)
     {
-        vibration_state =
-            VIB_MEDIUM;
+        vibration_state = VIB_MEDIUM;
     }
     else
     {
-        vibration_state =
-            VIB_LOW;
+        vibration_state = VIB_LOW;
     }
 
-
     printf("[MPU] Vibration RMS: ");
-
     PrintFloat3(vibration_rms);
-
     printf(" g\r\n");
-}
 
+    printf("[MPU] Health: %s | Recovery: %d/%d\r\n",
+           vibration_health ? "OK" : "FAULT",
+           vibration_good_cycles,
+           SENSOR_RECOVERY_CYCLES);
+}
 
 /* ============================================================
    FUSION
